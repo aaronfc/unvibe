@@ -12,6 +12,7 @@ test for skill drift: useful, imperfect, and intentionally small.
 bin/unvibe path/to/skill-dir
 bin/unvibe path/to/skill-dir --scenario happy_path
 bin/unvibe path/to/skill-dir --verbose
+bin/unvibe --create path/to/skill-dir
 ```
 
 Each skill directory must contain:
@@ -24,9 +25,27 @@ EVALUATION.yaml
 `unvibe` uses `claude -p` by default. Set `CLAUDE_BIN` to use a different
 Claude executable.
 
+## Creating EVALUATION.yaml
+
+Use `--create` to generate a first-pass eval file from an existing `SKILL.md`:
+
+```bash
+bin/unvibe --create path/to/skill-dir
+```
+
+This writes `path/to/skill-dir/EVALUATION.yaml`. If that file already exists,
+`unvibe` exits without changing it. Use `--force` to replace it:
+
+```bash
+bin/unvibe --create path/to/skill-dir --force
+```
+
+The generated file is a starting point. Read it before trusting it.
+
 ## EVALUATION.yaml
 
 ```yaml
+version: 1
 scenarios:
   - id: happy_path
     user_message: |

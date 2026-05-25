@@ -8,11 +8,14 @@ unvibe — Tiny pseudo-evals for SKILL.md files.
 
 Usage:
     unvibe <skill-dir> [--scenario <id>] [--verbose]
+    unvibe --create <skill-dir> [--force]
 
-Reads SKILL.md and EVALUATION.yaml from <skill-dir>. For each scenario:
+Normal mode reads SKILL.md and EVALUATION.yaml from <skill-dir>. For each scenario:
   1. Asks Claude (narrate-only) what tool calls it would make.
   2. Checks must_include / must_not_include regex patterns.
   3. Optionally asks an LLM judge to score rubric items.
+
+Create mode reads SKILL.md and writes a first-pass EVALUATION.yaml.
 
 Exits 0 if all scenarios pass, 1 otherwise.
 """
@@ -67,6 +70,82 @@ input, and the SAME LENGTH as the input. Each entry must be:
 No prose, no markdown fences, no other text — only the JSON array.
 """
 
+CREATE_INSTRUCTIONS = """\
+You are generating an EVALUATION.yaml file for unvibe, a tiny pseudo-eval
+runner for SKILL.md files.
+
+unvibe evaluates a skill by loading SKILL.md, showing the agent a user message,
+and asking it to output the JSON action plan it WOULD take. unvibe then checks:
+
+- must_include: Python regexes that must appear in flattened planned tool calls.
+- must_not_include: Python regexes that must not appear in planned tool calls.
+- rubric: natural-language claims judged against the planned action plan.
+
+The flattened plan looks like:
+  [0] Bash: git status --short
+  [1] Read: path/to/file
+
+Generate a detailed first-pass EVALUATION.yaml for the skill below.
+
+Required shape:
+
+version: 1
+scenarios:
+  - id: short_snake_case_id
+    user_message: |
+      A realistic message the user might send when invoking this skill.
+    must_include:
+      - 'ToolName: .*important action from the skill'
+    must_not_include:
+      - 'ToolName: .*forbidden action from the skill'
+    rubric:
+      - 'The plan follows an important semantic rule from the skill.'
+
+Rules:
+- Output ONLY YAML. No prose. No markdown fences.
+- Include top-level `version: 1` and `scenarios`.
+- Create 4 to 8 high-signal scenarios.
+- Use snake_case scenario ids.
+- Every scenario MUST use `user_message`, not `prompt`, `input`, or `query`.
+- Do not require the agent to read SKILL.md; unvibe already provides it.
+- Include happy paths, edge cases, skip/refusal behavior when relevant, and
+  anti-regressions for dangerous or explicitly forbidden actions.
+- Prefer concrete `must_include` / `must_not_include` regexes for tool usage.
+- `must_include` / `must_not_include` match planned tool calls only; normal
+  text replies are excluded.
+- Use `rubric` for semantic claims, prose style, refusal quality, and final
+  answer content.
+- If the skill's primary output is a direct answer to the user, do not require
+  Write/Edit tool calls unless the user message explicitly asks to create or
+  modify a file.
+- For "draft/write this content" scenarios without a target file path, assume
+  the agent replies with Text. Text is excluded from regex matching, so cover
+  those scenarios with `rubric` instead of Write/Edit assertions.
+- Use tool-call regexes only for concrete file, shell, network, browser, PR,
+  issue, or other tool workflows.
+- Do not put prose-quality phrases in `must_not_include` unless the skill is
+  expected to write or edit that prose through a tool call.
+- Do not assert exact commands unless the skill makes them explicit.
+- Remember regexes are case-insensitive Python regex strings.
+- Escape backslashes correctly for YAML double-quoted strings, or use single
+  quotes when easier.
+- Do not invent external systems, repo names, or file paths unless the skill
+  itself names them.
+"""
+
+REPAIR_CREATE_INSTRUCTIONS = """\
+Repair this generated EVALUATION.yaml so it validates for unvibe.
+
+Output ONLY YAML. No prose. No markdown fences.
+
+Every scenario must have:
+- id: non-empty string
+- user_message: non-empty string
+- at least one assertion in must_include, must_not_include, or rubric
+
+Keep the same intent, but fix the schema and any invalid regexes.
+"""
+
 
 def green(s: str) -> str:
     return f"\033[32m{s}\033[0m"
@@ -117,6 +196,105 @@ def extract_json_array(text: str) -> list[dict[str, Any]] | None:
         return json.loads(text[start : end + 1])
     except json.JSONDecodeError:
         return None
+
+
+def extract_yaml_document(text: str) -> str | None:
+    """Pull a YAML document out of a model response."""
+    if not text or text.startswith("__error__"):
+        return None
+    fence = re.search(r"```(?:ya?ml)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    text = text.strip()
+    for marker in ("version:", "scenarios:"):
+        match = re.search(rf"(?m)^{marker}", text)
+        if match:
+            return text[match.start() :].strip() + "\n"
+    return text + "\n" if text else None
+
+
+def validate_eval_spec(eval_spec: Any) -> None:
+    """Validate the small subset of EVALUATION.yaml that unvibe understands."""
+    if not isinstance(eval_spec, dict):
+        raise ValueError("expected top-level YAML mapping")
+
+    scenarios = eval_spec.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise ValueError("expected non-empty `scenarios` list")
+
+    for index, scenario in enumerate(scenarios):
+        prefix = f"scenario {index + 1}"
+        if not isinstance(scenario, dict):
+            raise ValueError(f"{prefix}: expected mapping")
+        if not isinstance(scenario.get("id"), str) or not scenario["id"].strip():
+            raise ValueError(f"{prefix}: expected non-empty string `id`")
+        if (
+            not isinstance(scenario.get("user_message"), str)
+            or not scenario["user_message"].strip()
+        ):
+            raise ValueError(
+                f"{prefix} ({scenario.get('id')}): "
+                "expected non-empty string `user_message`"
+            )
+
+        has_assertion = False
+        for key in ("must_include", "must_not_include", "rubric"):
+            items = scenario.get(key, [])
+            if items is None:
+                continue
+            if not isinstance(items, list):
+                raise ValueError(
+                    f"{prefix} ({scenario['id']}): `{key}` must be a list"
+                )
+            if items:
+                has_assertion = True
+            for item in items:
+                if not isinstance(item, str) or not item.strip():
+                    raise ValueError(
+                        f"{prefix} ({scenario['id']}): "
+                        f"`{key}` entries must be non-empty strings"
+                    )
+                if key in ("must_include", "must_not_include"):
+                    try:
+                        re.compile(item, re.IGNORECASE)
+                    except re.error as exc:
+                        raise ValueError(
+                            f"{prefix} ({scenario['id']}): "
+                            f"invalid regex in `{key}`: {item!r}: {exc}"
+                        ) from exc
+        if not has_assertion:
+            raise ValueError(
+                f"{prefix} ({scenario['id']}): expected at least one assertion"
+            )
+
+
+def create_evaluation_yaml(skill_md: str) -> str:
+    """Ask Claude to generate a first-pass EVALUATION.yaml for a skill."""
+    prompt = CREATE_INSTRUCTIONS + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n"
+    last_error = "unknown error"
+
+    for _ in range(2):
+        raw = call_claude(prompt, timeout=300)
+        yaml_text = extract_yaml_document(raw)
+        if yaml_text is None:
+            last_error = "could not parse YAML from Claude's response"
+        else:
+            try:
+                eval_spec = yaml.safe_load(yaml_text)
+                validate_eval_spec(eval_spec)
+                return yaml_text
+            except yaml.YAMLError as exc:
+                last_error = f"generated YAML is invalid: {exc}"
+            except ValueError as exc:
+                last_error = f"generated EVALUATION.yaml did not validate: {exc}"
+
+        prompt = (
+            REPAIR_CREATE_INSTRUCTIONS
+            + f"\n\n<ERROR>\n{last_error}\n</ERROR>\n"
+            + f"\n<GENERATED_EVALUATION>\n{yaml_text or raw}\n</GENERATED_EVALUATION>\n"
+        )
+
+    sys.exit(f"error: {last_error}")
 
 
 def plan_to_searchable(
@@ -271,7 +449,17 @@ def print_report(skill_name: str, results: list[dict[str, Any]], verbose: bool):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("skill_dir", help="Path to skill directory with SKILL.md and EVALUATION.yaml")
+    ap.add_argument("skill_dir", help="Path to skill directory")
+    ap.add_argument(
+        "--create",
+        action="store_true",
+        help="Generate EVALUATION.yaml from SKILL.md",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite EVALUATION.yaml when used with --create",
+    )
     ap.add_argument("--scenario", help="Run only this scenario id")
     ap.add_argument("--verbose", "-v", action="store_true", help="Show passing assertions + full plan")
     ap.add_argument("--parallel", type=int, default=3, help="Concurrent scenarios (default 3)")
@@ -282,6 +470,17 @@ def main():
     eval_path = skill_dir / "EVALUATION.yaml"
     if not skill_md_path.exists():
         sys.exit(f"error: {skill_md_path} not found")
+
+    if args.create:
+        if eval_path.exists() and not args.force:
+            sys.exit(
+                f"error: {eval_path} already exists. Use --force to overwrite it."
+            )
+        skill_md = skill_md_path.read_text()
+        eval_path.write_text(create_evaluation_yaml(skill_md))
+        print(f"created {eval_path}")
+        return
+
     if not eval_path.exists():
         sys.exit(f"error: {eval_path} not found")
 
