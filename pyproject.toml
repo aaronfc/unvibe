@@ -19,3 +19,12 @@ Repository = "https://github.com/aaronfc/unvibe"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/unvibe"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
