@@ -1,3 +1,5 @@
+![unvibe logo](https://github.com/user-attachments/assets/dc7558be-ae4d-4c84-a908-f7996ce630af)
+
 # unvibe
 
 Tiny pseudo-evals for `SKILL.md`.
