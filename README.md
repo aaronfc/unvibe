@@ -93,6 +93,14 @@ Exit code is `0` when every scenario passes and `1` otherwise.
 
 A runnable example lives in [`examples/sample-skill`](examples/sample-skill).
 
+The pure functions in `unvibe.cli` (response parsing, spec validation, plan
+flattening, pass/fail evaluation) have fast, offline unit tests. From a source
+checkout:
+
+```bash
+uv run pytest
+```
+
 `tests/smoke.sh` builds and runs the packaged command against that example
 using a stubbed `CLAUDE_BIN`, so it stays offline and deterministic:
 
