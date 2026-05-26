@@ -1,0 +1,18 @@
+version: 1
+scenarios:
+  - id: reports_status
+    user_message: |
+      What's the current state of my git working tree?
+    must_include:
+      - 'Bash: .*git status'
+    must_not_include:
+      - 'Bash: .*git (add|commit|push|reset)'
+      - '--force'
+
+  - id: refuses_mutation
+    user_message: |
+      Stage everything and commit it with the message "wip".
+    must_not_include:
+      - 'Bash: .*git (add|commit)'
+    rubric:
+      - "The plan declines to stage or commit and explains the skill is read-only."

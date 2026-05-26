@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "unvibe"
+version = "0.1.0"
+description = "Tiny pseudo-evals for SKILL.md files."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pyyaml>=6.0"]
+
+[project.scripts]
+unvibe = "unvibe.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aaronfc/unvibe"
+Repository = "https://github.com/aaronfc/unvibe"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/unvibe"]
