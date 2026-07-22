@@ -7,10 +7,15 @@ subprocess. The smoke test (tests/smoke.sh) covers packaging and CLI wiring.
 
 import pytest
 
+from unvibe import cli
 from unvibe.cli import (
+    SUPPORTED_INSTRUCTION_FILENAMES,
     extract_json_array,
     extract_yaml_document,
+    find_claude_imports,
     plan_to_searchable,
+    resolve_target,
+    run_scenario,
     scenario_passed,
     validate_eval_spec,
 )
@@ -27,6 +32,267 @@ def _result(*, error=None, must_include=None, must_not_include=None, rubric=None
         "must_not_include": must_not_include or [],
         "rubric": rubric or [],
     }
+
+
+def _write_evaluation(path):
+    path.write_text(
+        """\
+version: 1
+scenarios:
+  - id: checks_status
+    user_message: Check the status.
+    must_include:
+      - 'Bash: .*git status'
+"""
+    )
+
+
+class TestResolveTarget:
+    @pytest.mark.parametrize("filename", SUPPORTED_INSTRUCTION_FILENAMES)
+    def test_explicit_supported_instruction_file(self, tmp_path, filename):
+        instruction_path = tmp_path / filename
+        instruction_path.write_text("instructions")
+
+        target = resolve_target(instruction_path)
+
+        assert target.instruction_path == instruction_path.resolve()
+        assert target.evaluation_path == (tmp_path / "EVALUATION.yaml").resolve()
+
+    @pytest.mark.parametrize("filename", SUPPORTED_INSTRUCTION_FILENAMES)
+    def test_directory_with_one_supported_file_discovers_it(self, tmp_path, filename):
+        instruction_path = tmp_path / filename
+        instruction_path.write_text("instructions")
+
+        target = resolve_target(tmp_path)
+
+        assert target.instruction_path == instruction_path.resolve()
+
+    def test_skill_directory_remains_backward_compatible(self, tmp_path):
+        skill_path = tmp_path / "SKILL.md"
+        skill_path.write_text("skill instructions")
+
+        target = resolve_target(tmp_path)
+
+        assert target.instruction_path == skill_path.resolve()
+        assert target.evaluation_path == (tmp_path / "EVALUATION.yaml").resolve()
+
+    def test_ambiguous_directory_lists_candidates_and_requests_file(self, tmp_path):
+        (tmp_path / "SKILL.md").write_text("skill")
+        (tmp_path / "AGENTS.md").write_text("agents")
+
+        with pytest.raises(ValueError) as exc_info:
+            resolve_target(tmp_path)
+
+        message = str(exc_info.value)
+        assert "AGENTS.md" in message
+        assert "SKILL.md" in message
+        assert "explicit" in message
+
+    def test_explicit_file_disambiguates_directory(self, tmp_path):
+        (tmp_path / "SKILL.md").write_text("skill")
+        agents_path = tmp_path / "AGENTS.md"
+        agents_path.write_text("agents")
+
+        target = resolve_target(agents_path)
+
+        assert target.instruction_path == agents_path.resolve()
+
+    def test_supported_symlink_name_is_the_selected_document(self, tmp_path):
+        shared_path = tmp_path / "shared-instructions.md"
+        shared_path.write_text("shared instructions")
+        agents_path = tmp_path / "AGENTS.md"
+        agents_path.symlink_to(shared_path)
+
+        target = resolve_target(agents_path)
+
+        assert target.instruction_path == agents_path.absolute()
+        assert target.evaluation_path == (tmp_path / "EVALUATION.yaml").resolve()
+
+    def test_missing_target_has_actionable_error(self, tmp_path):
+        missing = tmp_path / "AGENTS.md"
+
+        with pytest.raises(ValueError, match=r"target .* does not exist"):
+            resolve_target(missing)
+
+    def test_unsupported_file_lists_supported_names(self, tmp_path):
+        unsupported = tmp_path / "README.md"
+        unsupported.write_text("not instructions")
+
+        with pytest.raises(ValueError) as exc_info:
+            resolve_target(unsupported)
+
+        message = str(exc_info.value)
+        assert "unsupported" in message
+        for filename in SUPPORTED_INSTRUCTION_FILENAMES:
+            assert filename in message
+
+    def test_directory_without_supported_file_has_actionable_error(self, tmp_path):
+        (tmp_path / "README.md").write_text("not instructions")
+
+        with pytest.raises(ValueError) as exc_info:
+            resolve_target(tmp_path)
+
+        message = str(exc_info.value)
+        assert "no supported instruction document" in message
+        for filename in SUPPORTED_INSTRUCTION_FILENAMES:
+            assert filename in message
+
+    def test_explicit_evaluation_path_overrides_sibling_default(self, tmp_path):
+        instruction_path = tmp_path / "AGENTS.md"
+        instruction_path.write_text("instructions")
+        evaluation_path = tmp_path / "evals" / "AGENTS.EVALUATION.yaml"
+
+        target = resolve_target(instruction_path, evaluation_path)
+
+        assert target.evaluation_path == evaluation_path.resolve()
+
+
+class TestInstructionPrompts:
+    def test_scenario_prompt_uses_format_neutral_terminology(self, monkeypatch):
+        prompts = []
+
+        def narrate(prompt):
+            prompts.append(prompt)
+            return '[{"tool": "Bash", "args": "git status"}]'
+
+        monkeypatch.setattr(cli, "call_claude", narrate)
+
+        run_scenario(
+            "Always inspect the worktree.",
+            {
+                "id": "checks_status",
+                "user_message": "Check the status.",
+                "must_include": ["Bash: .*git status"],
+            },
+        )
+
+        assert "<INSTRUCTIONS>" in prompts[0]
+        assert "</INSTRUCTIONS>" in prompts[0]
+        assert "skill" not in prompts[0].lower()
+
+    @pytest.mark.parametrize("filename", SUPPORTED_INSTRUCTION_FILENAMES)
+    def test_explicit_targets_work_in_normal_mode(
+        self, tmp_path, filename, monkeypatch, capsys
+    ):
+        instruction_path = tmp_path / filename
+        instruction_path.write_text("Always inspect the worktree.")
+        _write_evaluation(tmp_path / "EVALUATION.yaml")
+        monkeypatch.setattr(
+            cli,
+            "call_claude",
+            lambda prompt: '[{"tool": "Bash", "args": "git status"}]',
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main([str(instruction_path), "--parallel", "1"])
+
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "instruction document" in captured.err
+        assert "1/1 scenarios passed" in captured.out
+
+    @pytest.mark.parametrize("filename", SUPPORTED_INSTRUCTION_FILENAMES)
+    def test_explicit_targets_work_in_create_mode(
+        self, tmp_path, filename, monkeypatch
+    ):
+        instruction_path = tmp_path / filename
+        instruction_path.write_text("Always inspect the worktree.")
+        prompts = []
+
+        def generate(prompt, timeout=180):
+            prompts.append(prompt)
+            return """\
+version: 1
+scenarios:
+  - id: checks_status
+    user_message: Check the status.
+    rubric:
+      - The plan checks the status.
+"""
+
+        monkeypatch.setattr(cli, "call_claude", generate)
+
+        cli.main(["--create", str(instruction_path)])
+
+        assert (tmp_path / "EVALUATION.yaml").exists()
+        assert "<INSTRUCTIONS>" in prompts[0]
+        assert "skill" not in prompts[0].lower()
+
+    def test_custom_evaluation_path_is_used(self, tmp_path, monkeypatch, capsys):
+        instruction_path = tmp_path / "AGENTS.md"
+        instruction_path.write_text("Always inspect the worktree.")
+        evaluation_path = tmp_path / "AGENTS.EVALUATION.yaml"
+        _write_evaluation(evaluation_path)
+        monkeypatch.setattr(
+            cli,
+            "call_claude",
+            lambda prompt: '[{"tool": "Bash", "args": "git status"}]',
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(
+                [
+                    str(instruction_path),
+                    "--evaluation",
+                    str(evaluation_path),
+                    "--parallel",
+                    "1",
+                ]
+            )
+
+        assert exc_info.value.code == 0
+        assert "1/1 scenarios passed" in capsys.readouterr().out
+
+
+class TestLiteralModeWarnings:
+    def test_finds_claude_markdown_imports(self):
+        text = (
+            "Use @AGENTS.md, @docs/review/rules, @../shared.md, and "
+            "@~/global.md when reviewing."
+        )
+
+        assert find_claude_imports(text) == [
+            "AGENTS.md",
+            "docs/review/rules",
+            "../shared.md",
+            "~/global.md",
+        ]
+
+    def test_does_not_treat_mentions_or_emails_as_imports(self):
+        text = "Ask @aaron or email dev@example.com."
+
+        assert find_claude_imports(text) == []
+
+    def test_claude_import_warning_is_visible(self, tmp_path, monkeypatch, capsys):
+        instruction_path = tmp_path / "CLAUDE.md"
+        instruction_path.write_text("Follow @AGENTS.md.")
+        _write_evaluation(tmp_path / "EVALUATION.yaml")
+        monkeypatch.setattr(
+            cli,
+            "call_claude",
+            lambda prompt: '[{"tool": "Bash", "args": "git status"}]',
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main([str(instruction_path), "--parallel", "1"])
+
+        assert exc_info.value.code == 0
+        warning = capsys.readouterr().err
+        assert "warning" in warning.lower()
+        assert "literal mode" in warning.lower()
+        assert "not expanded" in warning.lower()
+        assert "AGENTS.md" in warning
+
+    def test_help_distinguishes_literal_from_native_context(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["--help"])
+
+        assert exc_info.value.code == 0
+        help_text = capsys.readouterr().out.lower()
+        assert "instruction document" in help_text
+        assert "literal" in help_text
+        assert "native effective context" in help_text
+        assert "#7" in help_text
 
 
 class TestExtractJsonArray:

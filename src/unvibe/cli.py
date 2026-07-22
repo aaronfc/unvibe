@@ -1,16 +1,23 @@
 """
-unvibe — Tiny pseudo-evals for SKILL.md files.
+unvibe — Tiny literal pseudo-evals for instruction documents.
 
 Usage:
-    unvibe <skill-dir> [--scenario <id>] [--verbose]
-    unvibe --create <skill-dir> [--force]
+    unvibe <target> [--evaluation <path>] [--scenario <id>] [--verbose]
+    unvibe --create <target> [--evaluation <path>] [--force]
 
-Normal mode reads SKILL.md and EVALUATION.yaml from <skill-dir>. For each scenario:
+The target may be a SKILL.md, AGENTS.md, or CLAUDE.md file, or a directory
+containing exactly one of those files. Normal mode uses the target's sibling
+EVALUATION.yaml unless --evaluation selects another file. For each scenario:
   1. Asks Claude (narrate-only) what tool calls it would make.
   2. Checks must_include / must_not_include regex patterns.
   3. Optionally asks an LLM judge to score rubric items.
 
-Create mode reads SKILL.md and writes a first-pass EVALUATION.yaml.
+Create mode reads the selected instruction document and writes a first-pass
+EVALUATION.yaml.
+
+Literal mode evaluates only the selected file's text. It does not reproduce
+native effective context, including parent chains, overrides, imports, or
+target-agent loading. Native context execution belongs with backend work in #7.
 
 Exits 0 if all scenarios pass, 1 otherwise.
 """
@@ -22,19 +29,28 @@ import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+SUPPORTED_INSTRUCTION_FILENAMES = ("SKILL.md", "AGENTS.md", "CLAUDE.md")
+DEFAULT_EVALUATION_FILENAME = "EVALUATION.yaml"
+CLAUDE_IMPORT_RE = re.compile(
+    r"(?<![\w@])@(?P<path>"
+    r"(?:~?/|\./|\.\./)?"
+    r"(?:[\w.-]+(?:/[\w.-]+)+|[\w.-]+\.(?:md|txt|ya?ml|json))"
+    r")"
+)
 NARRATE_INSTRUCTIONS = """\
-You are evaluating a skill. Below in the <SKILL> block is the skill's full
-instructions. In the <USER> block is a user message.
+You are evaluating an instruction document. Below in the <INSTRUCTIONS> block
+is the document's full text. In the <USER> block is a user message.
 
 Your task: imagine you are the agent receiving the user's message with this
-skill loaded in your context. Output a JSON array describing EVERY tool call
-you would make, in order. Each entry must have:
+instruction document loaded in your context. Output a JSON array describing
+EVERY tool call you would make, in order. Each entry must have:
 
   {"tool": "<tool name e.g. Bash, Edit, Read>",
    "args": "<the args you would pass, as a single string>",
@@ -44,8 +60,8 @@ CRITICAL:
 - Do NOT execute ANY tools yourself. Do not call Bash, Read, Edit, etc.
 - Output ONLY the JSON array. No prose, no markdown fences, no explanation.
 - If the user message asks you to refuse something (e.g., merging a PR that
-  the skill forbids), output the JSON array of actions you WOULD take —
-  which may be a short list ending with a text response, not tool calls.
+  the instructions forbid), output the JSON array of actions you WOULD take
+  — which may be a short list ending with a text response, not tool calls.
   Represent a text reply to the user as: {"tool": "Text", "args": "<reply>",
   "why": "<why>"}.
 """
@@ -67,10 +83,11 @@ No prose, no markdown fences, no other text — only the JSON array.
 
 CREATE_INSTRUCTIONS = """\
 You are generating an EVALUATION.yaml file for unvibe, a tiny pseudo-eval
-runner for SKILL.md files.
+runner for instruction documents.
 
-unvibe evaluates a skill by loading SKILL.md, showing the agent a user message,
-and asking it to output the JSON action plan it WOULD take. unvibe then checks:
+unvibe evaluates an instruction document by showing the agent the document and
+a user message, then asking it to output the JSON action plan it WOULD take.
+unvibe then checks:
 
 - must_include: Python regexes that must appear in flattened planned tool calls.
 - must_not_include: Python regexes that must not appear in planned tool calls.
@@ -80,7 +97,8 @@ The flattened plan looks like:
   [0] Bash: git status --short
   [1] Read: path/to/file
 
-Generate a detailed first-pass EVALUATION.yaml for the skill below.
+Generate a detailed first-pass EVALUATION.yaml for the instruction document
+below.
 
 Required shape:
 
@@ -88,13 +106,13 @@ version: 1
 scenarios:
   - id: short_snake_case_id
     user_message: |
-      A realistic message the user might send when invoking this skill.
+      A realistic message governed by this instruction document.
     must_include:
-      - 'ToolName: .*important action from the skill'
+      - 'ToolName: .*important action from the instructions'
     must_not_include:
-      - 'ToolName: .*forbidden action from the skill'
+      - 'ToolName: .*forbidden action from the instructions'
     rubric:
-      - 'The plan follows an important semantic rule from the skill.'
+      - 'The plan follows an important semantic rule from the instructions.'
 
 Rules:
 - Output ONLY YAML. No prose. No markdown fences.
@@ -102,7 +120,8 @@ Rules:
 - Create 4 to 8 high-signal scenarios.
 - Use snake_case scenario ids.
 - Every scenario MUST use `user_message`, not `prompt`, `input`, or `query`.
-- Do not require the agent to read SKILL.md; unvibe already provides it.
+- Do not require the agent to read the instruction document; unvibe already
+  provides it.
 - Include happy paths, edge cases, skip/refusal behavior when relevant, and
   anti-regressions for dangerous or explicitly forbidden actions.
 - Prefer concrete `must_include` / `must_not_include` regexes for tool usage.
@@ -110,22 +129,22 @@ Rules:
   text replies are excluded.
 - Use `rubric` for semantic claims, prose style, refusal quality, and final
   answer content.
-- If the skill's primary output is a direct answer to the user, do not require
-  Write/Edit tool calls unless the user message explicitly asks to create or
-  modify a file.
+- If the document's primary output is a direct answer to the user, do not
+  require Write/Edit tool calls unless the user message explicitly asks to
+  create or modify a file.
 - For "draft/write this content" scenarios without a target file path, assume
   the agent replies with Text. Text is excluded from regex matching, so cover
   those scenarios with `rubric` instead of Write/Edit assertions.
 - Use tool-call regexes only for concrete file, shell, network, browser, PR,
   issue, or other tool workflows.
-- Do not put prose-quality phrases in `must_not_include` unless the skill is
-  expected to write or edit that prose through a tool call.
-- Do not assert exact commands unless the skill makes them explicit.
+- Do not put prose-quality phrases in `must_not_include` unless the document
+  is expected to write or edit that prose through a tool call.
+- Do not assert exact commands unless the document makes them explicit.
 - Remember regexes are case-insensitive Python regex strings.
 - Escape backslashes correctly for YAML double-quoted strings, or use single
   quotes when easier.
-- Do not invent external systems, repo names, or file paths unless the skill
-  itself names them.
+- Do not invent external systems, repo names, or file paths unless the
+  instruction document itself names them.
 """
 
 REPAIR_CREATE_INSTRUCTIONS = """\
@@ -140,6 +159,93 @@ Every scenario must have:
 
 Keep the same intent, but fix the schema and any invalid regexes.
 """
+
+
+@dataclass(frozen=True)
+class EvaluationTarget:
+    """The instruction document and evaluation suite selected by the CLI."""
+
+    instruction_path: Path
+    evaluation_path: Path
+
+
+def resolve_target(
+    target: str | Path, evaluation: str | Path | None = None
+) -> EvaluationTarget:
+    """Resolve a supported instruction target and its evaluation file."""
+    # Preserve a supported symlink's filename: CLAUDE.md -> AGENTS.md is a
+    # documented interoperability pattern, and the selected file's sibling
+    # still determines the default evaluation path.
+    target_path = Path(target).expanduser().absolute()
+    supported_names = ", ".join(SUPPORTED_INSTRUCTION_FILENAMES)
+
+    if not target_path.exists():
+        raise ValueError(f"target {target_path} does not exist")
+
+    if target_path.is_dir():
+        candidates = [
+            target_path / filename
+            for filename in SUPPORTED_INSTRUCTION_FILENAMES
+            if (target_path / filename).is_file()
+        ]
+        if not candidates:
+            raise ValueError(
+                f"target directory {target_path} contains no supported "
+                f"instruction document; expected one of: {supported_names}"
+            )
+        if len(candidates) > 1:
+            candidate_names = ", ".join(path.name for path in candidates)
+            raise ValueError(
+                f"target directory {target_path} contains multiple supported "
+                f"instruction documents: {candidate_names}. Pass one of those "
+                "files explicitly."
+            )
+        instruction_path = candidates[0]
+    elif target_path.is_file():
+        if target_path.name not in SUPPORTED_INSTRUCTION_FILENAMES:
+            raise ValueError(
+                f"unsupported instruction document {target_path}; expected a "
+                f"file named one of: {supported_names}"
+            )
+        instruction_path = target_path
+    else:
+        raise ValueError(f"target {target_path} is not a regular file or directory")
+
+    if evaluation is None:
+        evaluation_path = instruction_path.parent / DEFAULT_EVALUATION_FILENAME
+    else:
+        evaluation_path = Path(evaluation).expanduser().resolve()
+
+    return EvaluationTarget(
+        instruction_path=instruction_path,
+        evaluation_path=evaluation_path,
+    )
+
+
+def find_claude_imports(instruction_text: str) -> list[str]:
+    """Return unique CLAUDE.md import paths found in document order."""
+    return list(
+        dict.fromkeys(
+            match.group("path") for match in CLAUDE_IMPORT_RE.finditer(instruction_text)
+        )
+    )
+
+
+def warn_about_literal_claude_imports(
+    instruction_path: Path, instruction_text: str
+) -> None:
+    """Warn when literal evaluation leaves CLAUDE.md imports unresolved."""
+    if instruction_path.name != "CLAUDE.md":
+        return
+
+    imports = find_claude_imports(instruction_text)
+    if imports:
+        print(
+            "warning: CLAUDE.md imports are not expanded in literal mode: "
+            f"{', '.join(imports)}. Only {instruction_path.name} is evaluated; "
+            "native effective-context execution is out of scope (see #7).",
+            file=sys.stderr,
+        )
 
 
 def green(s: str) -> str:
@@ -263,9 +369,12 @@ def validate_eval_spec(eval_spec: Any) -> None:
             )
 
 
-def create_evaluation_yaml(skill_md: str) -> str:
-    """Ask Claude to generate a first-pass EVALUATION.yaml for a skill."""
-    prompt = CREATE_INSTRUCTIONS + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n"
+def create_evaluation_yaml(instruction_text: str) -> str:
+    """Ask Claude to generate a first-pass evaluation for an instruction document."""
+    prompt = (
+        CREATE_INSTRUCTIONS
+        + f"\n\n<INSTRUCTIONS>\n{instruction_text}\n</INSTRUCTIONS>\n"
+    )
     last_error = "unknown error"
 
     for _ in range(2):
@@ -315,12 +424,15 @@ def plan_to_searchable(
     return "\n".join(parts)
 
 
-def run_scenario(skill_md: str, scenario: dict[str, Any]) -> dict[str, Any]:
+def run_scenario(
+    instruction_text: str, scenario: dict[str, Any]
+) -> dict[str, Any]:
     """Run one scenario; return a result dict."""
     user_msg = scenario["user_message"]
     prompt = (
         NARRATE_INSTRUCTIONS
-        + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n\n<USER>\n{user_msg}\n</USER>\n"
+        + f"\n\n<INSTRUCTIONS>\n{instruction_text}\n</INSTRUCTIONS>"
+        + f"\n\n<USER>\n{user_msg}\n</USER>\n"
     )
     raw = call_claude(prompt)
     plan = extract_json_array(raw)
@@ -398,9 +510,14 @@ def scenario_passed(result: dict[str, Any]) -> bool:
     return True
 
 
-def print_report(skill_name: str, results: list[dict[str, Any]], verbose: bool):
+def print_report(
+    instruction_name: str, results: list[dict[str, Any]], verbose: bool
+):
     passed_count = sum(1 for r in results if scenario_passed(r))
-    print(f"\n{skill_name} — {len(results)} scenario(s)\n")
+    print(
+        f"\nInstruction document: {instruction_name} — "
+        f"{len(results)} scenario(s)\n"
+    )
 
     for r in results:
         mark = green("✓") if scenario_passed(r) else red("✗")
@@ -442,56 +559,85 @@ def print_report(skill_name: str, results: list[dict[str, Any]], verbose: bool):
     print(f"\n  {passed_count}/{len(results)} scenarios passed\n")
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("skill_dir", help="Path to skill directory")
+def main(argv: list[str] | None = None):
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "target",
+        help=(
+            "Supported instruction document, or a directory containing exactly "
+            "one"
+        ),
+    )
     ap.add_argument(
         "--create",
         action="store_true",
-        help="Generate EVALUATION.yaml from SKILL.md",
+        help="Generate an evaluation from the selected instruction document",
     )
     ap.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite EVALUATION.yaml when used with --create",
+        help="Overwrite the selected evaluation file when used with --create",
+    )
+    ap.add_argument(
+        "--evaluation",
+        metavar="PATH",
+        help="Evaluation YAML path (default: EVALUATION.yaml beside the target)",
     )
     ap.add_argument("--scenario", help="Run only this scenario id")
-    ap.add_argument("--verbose", "-v", action="store_true", help="Show passing assertions + full plan")
-    ap.add_argument("--parallel", type=int, default=3, help="Concurrent scenarios (default 3)")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show passing assertions and full plans",
+    )
+    ap.add_argument(
+        "--parallel", type=int, default=3, help="Concurrent scenarios (default 3)"
+    )
+    args = ap.parse_args(argv)
 
-    skill_dir = Path(args.skill_dir).resolve()
-    skill_md_path = skill_dir / "SKILL.md"
-    eval_path = skill_dir / "EVALUATION.yaml"
-    if not skill_md_path.exists():
-        sys.exit(f"error: {skill_md_path} not found")
+    try:
+        target = resolve_target(args.target, args.evaluation)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+
+    instruction_text = target.instruction_path.read_text()
+    warn_about_literal_claude_imports(target.instruction_path, instruction_text)
 
     if args.create:
-        if eval_path.exists() and not args.force:
+        if target.evaluation_path.exists() and not args.force:
             sys.exit(
-                f"error: {eval_path} already exists. Use --force to overwrite it."
+                f"error: {target.evaluation_path} already exists. "
+                "Use --force to overwrite it."
             )
-        skill_md = skill_md_path.read_text()
-        eval_path.write_text(create_evaluation_yaml(skill_md))
-        print(f"created {eval_path}")
+        target.evaluation_path.write_text(create_evaluation_yaml(instruction_text))
+        print(f"created {target.evaluation_path}")
         return
 
-    if not eval_path.exists():
-        sys.exit(f"error: {eval_path} not found")
+    if not target.evaluation_path.exists():
+        sys.exit(f"error: {target.evaluation_path} not found")
 
-    skill_md = skill_md_path.read_text()
-    eval_spec = yaml.safe_load(eval_path.read_text())
+    eval_spec = yaml.safe_load(target.evaluation_path.read_text())
     scenarios = eval_spec.get("scenarios", [])
     if args.scenario:
         scenarios = [s for s in scenarios if s["id"] == args.scenario]
         if not scenarios:
             sys.exit(f"error: no scenario with id '{args.scenario}'")
 
-    print(f"Running {len(scenarios)} scenario(s) against {skill_dir.name}", file=sys.stderr)
+    print(
+        f"Running {len(scenarios)} scenario(s) against instruction document "
+        f"{target.instruction_path.name} in literal mode",
+        file=sys.stderr,
+    )
 
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=args.parallel) as ex:
-        futures = {ex.submit(run_scenario, skill_md, s): s for s in scenarios}
+        futures = {
+            ex.submit(run_scenario, instruction_text, scenario): scenario
+            for scenario in scenarios
+        }
         for fut in as_completed(futures):
             s = futures[fut]
             try:
@@ -503,7 +649,7 @@ def main():
                 print(f"  ✗ {s['id']} crashed: {e}", file=sys.stderr)
 
     results.sort(key=lambda r: [s["id"] for s in scenarios].index(r["id"]))
-    print_report(skill_dir.name, results, args.verbose)
+    print_report(target.instruction_path.name, results, args.verbose)
     sys.exit(0 if all(scenario_passed(r) for r in results) else 1)
 
 
