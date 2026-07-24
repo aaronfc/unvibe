@@ -17,6 +17,7 @@ from unvibe.cli import (
     extract_yaml_document,
     parse_args,
     plan_to_searchable,
+    run_scenario,
     scenario_passed,
     validate_eval_spec,
 )
@@ -135,34 +136,109 @@ class TestHarnessCommands:
 
 
 class TestRuntimeConfiguration:
-    def test_defaults_to_claude_and_native_model(self, monkeypatch):
-        monkeypatch.delenv("UNVIBE_HARNESS", raising=False)
-        monkeypatch.delenv("UNVIBE_MODEL", raising=False)
+    @pytest.fixture(autouse=True)
+    def clear_runtime_environment(self, monkeypatch):
+        for name in (
+            "UNVIBE_HARNESS",
+            "UNVIBE_MODEL",
+            "UNVIBE_EVALUATION_MODEL",
+            "UNVIBE_RUBRIC_MODEL",
+        ):
+            monkeypatch.delenv(name, raising=False)
 
+    def test_defaults_to_claude_and_native_models(self):
         args = parse_args(["skill"])
 
         assert args.harness == "claude"
-        assert args.model is None
+        assert args.evaluation_model is None
+        assert args.rubric_model is None
 
-    def test_environment_configures_harness_and_model(self, monkeypatch):
+    def test_environment_configures_harness_and_both_models(self, monkeypatch):
         monkeypatch.setenv("UNVIBE_HARNESS", "opencode")
-        monkeypatch.setenv("UNVIBE_MODEL", "provider/model")
+        monkeypatch.setenv("UNVIBE_EVALUATION_MODEL", "provider/evaluator")
+        monkeypatch.setenv("UNVIBE_RUBRIC_MODEL", "provider/judge")
 
         args = parse_args(["skill"])
 
         assert args.harness == "opencode"
-        assert args.model == "provider/model"
+        assert args.evaluation_model == "provider/evaluator"
+        assert args.rubric_model == "provider/judge"
 
     def test_cli_overrides_environment(self, monkeypatch):
         monkeypatch.setenv("UNVIBE_HARNESS", "opencode")
-        monkeypatch.setenv("UNVIBE_MODEL", "provider/environment-model")
+        monkeypatch.setenv("UNVIBE_EVALUATION_MODEL", "environment-evaluator")
+        monkeypatch.setenv("UNVIBE_RUBRIC_MODEL", "environment-judge")
 
         args = parse_args(
-            ["skill", "--harness", "codex", "--model", "command-line-model"]
+            [
+                "skill",
+                "--harness",
+                "codex",
+                "--evaluation-model",
+                "command-line-evaluator",
+                "--rubric-model",
+                "command-line-judge",
+            ]
         )
 
         assert args.harness == "codex"
-        assert args.model == "command-line-model"
+        assert args.evaluation_model == "command-line-evaluator"
+        assert args.rubric_model == "command-line-judge"
+
+    def test_rubric_model_defaults_to_evaluation_model(self):
+        args = parse_args(
+            ["skill", "--evaluation-model", "shared-command-line-model"]
+        )
+
+        assert args.evaluation_model == "shared-command-line-model"
+        assert args.rubric_model == "shared-command-line-model"
+
+    def test_legacy_model_flag_configures_both_models(self):
+        args = parse_args(["skill", "--model", "legacy-command-line-model"])
+
+        assert args.evaluation_model == "legacy-command-line-model"
+        assert args.rubric_model == "legacy-command-line-model"
+
+    def test_legacy_model_environment_configures_both_models(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("UNVIBE_MODEL", "provider/legacy-model")
+
+        args = parse_args(["skill"])
+
+        assert args.harness == "claude"
+        assert args.evaluation_model == "provider/legacy-model"
+        assert args.rubric_model == "provider/legacy-model"
+
+
+class TestScenarioModels:
+    def test_uses_evaluation_model_for_plan_and_rubric_model_for_judge(
+        self, monkeypatch
+    ):
+        calls = []
+
+        def call(prompt, harness, model, timeout=180):
+            calls.append((harness, model))
+            if len(calls) == 1:
+                return '[{"tool": "Read", "args": "README.md"}]'
+            return '[{"verdict": "PASS", "reason": "The plan reads it."}]'
+
+        monkeypatch.setattr(cli, "call_harness", call)
+
+        result = run_scenario(
+            "skill instructions",
+            {
+                "id": "reads_docs",
+                "user_message": "Read the docs",
+                "rubric": ["The plan reads the documentation."],
+            },
+            "claude",
+            "sonnet",
+            "haiku",
+        )
+
+        assert calls == [("claude", "sonnet"), ("claude", "haiku")]
+        assert result["rubric"][0]["passed"] is True
 
 
 class TestExtractJsonArray:

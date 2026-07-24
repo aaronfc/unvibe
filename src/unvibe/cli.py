@@ -2,8 +2,8 @@
 unvibe — Tiny pseudo-evals for SKILL.md files.
 
 Usage:
-    unvibe <skill-dir> [--harness <name>] [--model <model>]
-    unvibe --create <skill-dir> [--harness <name>] [--model <model>]
+    unvibe <skill-dir> [--harness <name>] [--evaluation-model <model>]
+    unvibe --create <skill-dir> [--harness <name>] [--evaluation-model <model>]
 
 Normal mode reads SKILL.md and EVALUATION.yaml from <skill-dir>. For each scenario:
   1. Asks the selected coding-agent harness what tool calls it would make.
@@ -313,14 +313,14 @@ def validate_eval_spec(eval_spec: Any) -> None:
 def create_evaluation_yaml(
     skill_md: str,
     harness: str = DEFAULT_HARNESS,
-    model: str | None = None,
+    evaluation_model: str | None = None,
 ) -> str:
     """Ask a coding-agent harness to generate a first-pass EVALUATION.yaml."""
     prompt = CREATE_INSTRUCTIONS + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n"
     last_error = "unknown error"
 
     for _ in range(2):
-        raw = call_harness(prompt, harness, model, timeout=300)
+        raw = call_harness(prompt, harness, evaluation_model, timeout=300)
         yaml_text = extract_yaml_document(raw)
         if yaml_text is None:
             last_error = f"could not parse YAML from {harness}'s response"
@@ -370,7 +370,8 @@ def run_scenario(
     skill_md: str,
     scenario: dict[str, Any],
     harness: str = DEFAULT_HARNESS,
-    model: str | None = None,
+    evaluation_model: str | None = None,
+    rubric_model: str | None = None,
 ) -> dict[str, Any]:
     """Run one scenario; return a result dict."""
     user_msg = scenario["user_message"]
@@ -378,7 +379,7 @@ def run_scenario(
         NARRATE_INSTRUCTIONS
         + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n\n<USER>\n{user_msg}\n</USER>\n"
     )
-    raw = call_harness(prompt, harness, model)
+    raw = call_harness(prompt, harness, evaluation_model)
     plan = extract_json_array(raw)
 
     result: dict[str, Any] = {
@@ -424,7 +425,8 @@ def run_scenario(
             JUDGE_INSTRUCTIONS
             + f"\n\n<PLAN>\n{plan_json}\n</PLAN>\n\n<CLAIMS>\n{claims_block}\n</CLAIMS>\n"
         )
-        raw_verdicts = call_harness(judge_prompt, harness, model)
+        judge_model = rubric_model if rubric_model is not None else evaluation_model
+        raw_verdicts = call_harness(judge_prompt, harness, judge_model)
         parsed = extract_json_array(raw_verdicts)
 
         if not isinstance(parsed, list) or len(parsed) != len(claims):
@@ -519,8 +521,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Coding-agent harness (default: $UNVIBE_HARNESS or claude)",
     )
     ap.add_argument(
+        "--evaluation-model",
         "--model",
-        help="Harness model (default: $UNVIBE_MODEL or harness native default)",
+        dest="evaluation_model",
+        help=(
+            "Scenario model (default: $UNVIBE_EVALUATION_MODEL, "
+            "$UNVIBE_MODEL, or harness native default)"
+        ),
+    )
+    ap.add_argument(
+        "--rubric-model",
+        help=(
+            "Rubric judge model (default: $UNVIBE_RUBRIC_MODEL or "
+            "evaluation model)"
+        ),
     )
     ap.add_argument(
         "--verbose",
@@ -545,8 +559,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f"$UNVIBE_HARNESS must be one of: {choices} "
             f"(got {args.harness!r})"
         )
-    if args.model is None:
-        args.model = os.environ.get("UNVIBE_MODEL") or None
+    if args.evaluation_model is None:
+        args.evaluation_model = (
+            os.environ.get("UNVIBE_EVALUATION_MODEL")
+            or os.environ.get("UNVIBE_MODEL")
+            or None
+        )
+    if args.rubric_model is None:
+        args.rubric_model = (
+            os.environ.get("UNVIBE_RUBRIC_MODEL") or args.evaluation_model
+        )
     return args
 
 
@@ -566,7 +588,7 @@ def main(argv: list[str] | None = None):
             )
         skill_md = skill_md_path.read_text()
         eval_path.write_text(
-            create_evaluation_yaml(skill_md, args.harness, args.model)
+            create_evaluation_yaml(skill_md, args.harness, args.evaluation_model)
         )
         print(f"created {eval_path}")
         return
@@ -592,7 +614,8 @@ def main(argv: list[str] | None = None):
                 skill_md,
                 s,
                 args.harness,
-                args.model,
+                args.evaluation_model,
+                args.rubric_model,
             ): s
             for s in scenarios
         }

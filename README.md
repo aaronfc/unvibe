@@ -35,7 +35,8 @@ unvibe path/to/skill-dir --scenario happy_path
 unvibe path/to/skill-dir --verbose
 unvibe path/to/skill-dir --parallel 5
 unvibe path/to/skill-dir --harness codex
-unvibe path/to/skill-dir --harness opencode --model provider/model
+unvibe path/to/skill-dir --harness opencode --evaluation-model provider/model
+unvibe path/to/skill-dir --evaluation-model sonnet --rubric-model haiku
 unvibe --create path/to/skill-dir
 ```
 
@@ -54,19 +55,25 @@ Code remains the default for backward compatibility.
 Configuration uses this precedence:
 
 ```text
---harness > UNVIBE_HARNESS > claude
---model   > UNVIBE_MODEL   > selected harness's native default
+--harness         > UNVIBE_HARNESS          > claude
+--evaluation-model > UNVIBE_EVALUATION_MODEL > UNVIBE_MODEL > native default
+--rubric-model     > UNVIBE_RUBRIC_MODEL     > resolved evaluation model
 ```
 
 For example:
 
 ```bash
-export UNVIBE_HARNESS=codex
+export UNVIBE_HARNESS=claude
+export UNVIBE_EVALUATION_MODEL=sonnet
+export UNVIBE_RUBRIC_MODEL=haiku
 unvibe path/to/skill-dir
 ```
 
-Leave the model unset to inherit the selected harness's normal configuration.
-Set `--model` or `UNVIBE_MODEL` when an evaluation needs a pinned model.
+Leave both models unset to inherit the selected harness's normal
+configuration. By default, rubric judging uses the resolved evaluation model;
+set `--rubric-model` or `UNVIBE_RUBRIC_MODEL` to use a cheaper or specialized
+judge. The original `--model` option remains an alias for
+`--evaluation-model`, and `UNVIBE_MODEL` remains its environment fallback.
 OpenCode models use its `provider/model` format.
 
 The native noninteractive adapters invoke:

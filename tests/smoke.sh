@@ -20,10 +20,21 @@ trap 'rm -rf "$tmp"' EXIT
 # the read-only sample skill is expected to produce.
 cat > "$tmp/harness-stub" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$@" > "$UNVIBE_SMOKE_ARGS"
+printf '%q ' "$@" >> "$UNVIBE_SMOKE_ARGS"
+printf '\n' >> "$UNVIBE_SMOKE_ARGS"
+if [[ "$*" == *"You are grading several independent claims"* ]]; then
+  cat <<'JSON'
+[{"verdict": "PASS", "reason": "The plan preserves read-only behavior."}]
+JSON
+elif [[ "$*" == *"Stage everything and commit it"* ]]; then
+  cat <<'JSON'
+[{"tool": "Text", "args": "I cannot mutate the read-only working tree.", "why": "decline mutation"}]
+JSON
+else
 cat <<'JSON'
 [{"tool": "Bash", "args": "git status --short", "why": "inspect the working tree"}]
 JSON
+fi
 EOF
 chmod +x "$tmp/harness-stub"
 cp "$tmp/harness-stub" "$tmp/claude"
@@ -34,16 +45,17 @@ export CODEX_BIN="$tmp/codex"
 export OPENCODE_BIN="$tmp/opencode"
 
 echo "smoke: unvibe --help"
-uvx --from . unvibe --help >/dev/null
+uvx --refresh-package unvibe --from . unvibe --help >/dev/null
 
 for harness in claude codex opencode; do
   echo "smoke: evaluate with $harness"
   export UNVIBE_SMOKE_ARGS="$tmp/$harness.args"
+  : > "$UNVIBE_SMOKE_ARGS"
   out="$(
     uvx --from . unvibe examples/sample-skill \
       --scenario reports_status \
       --harness "$harness" \
-      --model smoke-model
+      --evaluation-model smoke-model
   )"
   echo "$out"
 
@@ -52,7 +64,7 @@ for harness in claude codex opencode; do
     exit 1
   fi
 
-  args="$(tr '\n' ' ' < "$UNVIBE_SMOKE_ARGS")"
+  args="$(sed -n '1p' "$UNVIBE_SMOKE_ARGS")"
   case "$harness" in
     claude)
       expected="-p --no-session-persistence --model smoke-model "
@@ -69,5 +81,33 @@ for harness in claude codex opencode; do
     exit 1
   fi
 done
+
+echo "smoke: separate evaluation and rubric models"
+export UNVIBE_SMOKE_ARGS="$tmp/split-model.args"
+: > "$UNVIBE_SMOKE_ARGS"
+out="$(
+  uvx --from . unvibe examples/sample-skill \
+    --scenario refuses_mutation \
+    --harness claude \
+    --evaluation-model sonnet-test \
+    --rubric-model haiku-test
+)"
+echo "$out"
+
+if ! echo "$out" | grep -q "1/1 scenarios passed"; then
+  echo "FAIL: expected split-model scenario to pass" >&2
+  exit 1
+fi
+
+evaluation_args="$(sed -n '1p' "$UNVIBE_SMOKE_ARGS")"
+rubric_args="$(sed -n '2p' "$UNVIBE_SMOKE_ARGS")"
+if [[ "$evaluation_args" != "-p --no-session-persistence --model sonnet-test "* ]]; then
+  echo "FAIL: evaluation call did not use sonnet-test: $evaluation_args" >&2
+  exit 1
+fi
+if [[ "$rubric_args" != "-p --no-session-persistence --model haiku-test "* ]]; then
+  echo "FAIL: rubric call did not use haiku-test: $rubric_args" >&2
+  exit 1
+fi
 
 echo "SMOKE OK"
