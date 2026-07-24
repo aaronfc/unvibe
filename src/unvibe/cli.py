@@ -15,17 +15,19 @@ Normal mode reads SKILL.md and EVALUATION.yaml from <skill-dir>. For each scenar
 
 Create mode reads SKILL.md and writes a first-pass EVALUATION.yaml.
 
-Exits 0 if all scenarios pass, 1 otherwise.
+Exits 0 if all scenarios pass, 1 otherwise, or 130 when interrupted.
 """
 
 import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any
 
 import yaml
@@ -53,6 +55,9 @@ HARNESS_COMMANDS = {
     "codex": ("exec", "--ephemeral"),
     "opencode": ("run",),
 }
+_HARNESS_PROCESSES: set[subprocess.Popen[str]] = set()
+_HARNESS_PROCESSES_LOCK = Lock()
+_INTERRUPTED = Event()
 NARRATE_INSTRUCTIONS = """\
 You are evaluating a skill. Below in the <SKILL> block is the skill's full
 instructions. In the <USER> block is a user message.
@@ -203,6 +208,33 @@ def build_harness_command(
     return command
 
 
+def _terminate_harness_process(
+    process: subprocess.Popen[str], *, force: bool = False
+) -> None:
+    """Stop a harness and any child processes it spawned."""
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            os.killpg(process.pid, sig)
+        elif force:
+            process.kill()
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
+
+
+def _stop_harness_processes(*, force: bool = False) -> None:
+    """Prevent new harness calls and stop all active ones."""
+    _INTERRUPTED.set()
+    with _HARNESS_PROCESSES_LOCK:
+        processes = list(_HARNESS_PROCESSES)
+    for process in processes:
+        _terminate_harness_process(process, force=force)
+
+
 def call_harness(
     prompt: str,
     harness: str,
@@ -213,26 +245,45 @@ def call_harness(
     """Invoke a coding-agent harness and return its assistant text."""
     command = build_harness_command(harness, prompt, model, effort)
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        with _HARNESS_PROCESSES_LOCK:
+            if _INTERRUPTED.is_set():
+                return f"{HARNESS_ERROR_PREFIX} interrupted"
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            _HARNESS_PROCESSES.add(process)
     except FileNotFoundError:
         binary = HARNESS_BINS[harness]
         sys.exit(
             f"error: '{binary}' not on PATH. Set ${HARNESS_BIN_ENV[harness]}."
         )
-    except subprocess.TimeoutExpired:
-        return f"{HARNESS_ERROR_PREFIX} {harness} timed out after {timeout}s"
-    if result.returncode != 0:
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_harness_process(process, force=True)
+            process.communicate()
+            return f"{HARNESS_ERROR_PREFIX} {harness} timed out after {timeout}s"
+        except KeyboardInterrupt:
+            _terminate_harness_process(process)
+            process.wait()
+            raise
+    finally:
+        with _HARNESS_PROCESSES_LOCK:
+            _HARNESS_PROCESSES.discard(process)
+
+    if _INTERRUPTED.is_set():
+        return f"{HARNESS_ERROR_PREFIX} interrupted"
+    if process.returncode != 0:
         return (
-            f"{HARNESS_ERROR_PREFIX} {harness} exited {result.returncode}: "
-            f"{result.stderr.strip()}"
+            f"{HARNESS_ERROR_PREFIX} {harness} exited {process.returncode}: "
+            f"{stderr.strip()}"
         )
-    return result.stdout.strip()
+    return stdout.strip()
 
 
 def harness_error_message(text: str) -> str | None:
@@ -812,7 +863,7 @@ def run_setup(args: argparse.Namespace) -> None:
     print(f"  effort: {args.effort}")
 
 
-def main(argv: list[str] | None = None):
+def _main(argv: list[str] | None = None):
     args = parse_args(argv)
     if args.command == "setup":
         run_setup(args)
@@ -860,20 +911,22 @@ def main(argv: list[str] | None = None):
         file=sys.stderr,
     )
 
+    _INTERRUPTED.clear()
     results: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=args.parallel) as ex:
-        futures = {
-            ex.submit(
+    executor = ThreadPoolExecutor(max_workers=args.parallel)
+    futures = {}
+    try:
+        for scenario in scenarios:
+            future = executor.submit(
                 run_scenario,
                 skill_md,
-                s,
+                scenario,
                 args.harness,
                 args.evaluation_model,
                 args.rubric_model,
                 args.effort,
-            ): s
-            for s in scenarios
-        }
+            )
+            futures[future] = scenario
         for fut in as_completed(futures):
             s = futures[fut]
             try:
@@ -883,10 +936,31 @@ def main(argv: list[str] | None = None):
                 results.append({"id": s["id"], "error": str(e), "plan": None, "raw": "",
                                 "must_include": [], "must_not_include": [], "rubric": []})
                 print(f"  ✗ {s['id']} crashed: {e}", file=sys.stderr)
+    except KeyboardInterrupt:
+        for future in futures:
+            future.cancel()
+        _stop_harness_processes()
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except KeyboardInterrupt:
+            _stop_harness_processes(force=True)
+            executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown()
 
     results.sort(key=lambda r: [s["id"] for s in scenarios].index(r["id"]))
     print_report(skill_dir.name, results, args.verbose)
     sys.exit(0 if all(scenario_passed(r) for r in results) else 1)
+
+
+def main(argv: list[str] | None = None):
+    try:
+        _main(argv)
+    except KeyboardInterrupt:
+        _stop_harness_processes()
+        print("\nInterrupted. Stopped running scenarios.", file=sys.stderr)
+        raise SystemExit(130) from None
 
 
 if __name__ == "__main__":

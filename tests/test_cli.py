@@ -5,7 +5,11 @@ evaluate scenario results — directly and offline. The smoke test
 (tests/smoke.sh) covers packaging and CLI wiring.
 """
 
+import os
+import signal
 import subprocess
+import sys
+import time
 
 import pytest
 import yaml
@@ -102,12 +106,19 @@ class TestHarnessCommands:
         monkeypatch.setitem(cli.HARNESS_BINS, "codex", "test-codex")
         observed = {}
 
-        def run(command, **kwargs):
+        class Process:
+            returncode = 0
+
+            def communicate(self, timeout):
+                observed["timeout"] = timeout
+                return ("answer\n", "")
+
+        def popen(command, **kwargs):
             observed["command"] = command
             observed["kwargs"] = kwargs
-            return subprocess.CompletedProcess(command, 0, stdout="answer\n", stderr="")
+            return Process()
 
-        monkeypatch.setattr(cli.subprocess, "run", run)
+        monkeypatch.setattr(cli.subprocess, "Popen", popen)
 
         assert (
             call_harness(
@@ -131,24 +142,46 @@ class TestHarnessCommands:
                 "hello",
             ],
             "kwargs": {
-                "capture_output": True,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
                 "text": True,
-                "timeout": 12,
-                "check": False,
+                "start_new_session": True,
             },
+            "timeout": 12,
         }
 
     def test_call_harness_reports_timeout_with_harness_and_duration(
         self, monkeypatch
     ):
-        def run(command, **kwargs):
-            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        class Process:
+            returncode = None
 
-        monkeypatch.setattr(cli.subprocess, "run", run)
+            def __init__(self):
+                self.communicate_calls = 0
+
+            def communicate(self, timeout=None):
+                self.communicate_calls += 1
+                if self.communicate_calls == 1:
+                    raise subprocess.TimeoutExpired("test-codex", timeout)
+                return ("", "")
+
+        process = Process()
+        terminated = []
+        monkeypatch.setattr(
+            cli.subprocess, "Popen", lambda *args, **kwargs: process
+        )
+        monkeypatch.setattr(
+            cli,
+            "_terminate_harness_process",
+            lambda observed_process, *, force=False: terminated.append(
+                (observed_process, force)
+            ),
+        )
 
         assert call_harness("hello", "codex", "gpt-test") == (
             "__error__: codex timed out after 300s"
         )
+        assert terminated == [(process, True)]
         assert DEFAULT_HARNESS_TIMEOUT_SECONDS == 300
 
     def test_create_surfaces_harness_error(self, monkeypatch):
@@ -166,6 +199,88 @@ class TestHarnessCommands:
                 "codex",
                 "gpt-test",
             )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX signal behavior"
+)
+class TestInterruptHandling:
+    def test_sigint_stops_harness_without_traceback(
+        self, tmp_path
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Always inspect README.md.\n")
+        (skill_dir / "EVALUATION.yaml").write_text(
+            "version: 1\n"
+            "scenarios:\n"
+            "  - id: waiting\n"
+            "    user_message: Inspect the repository.\n"
+            "    must_include:\n"
+            "      - 'Read: .*README.md'\n"
+        )
+
+        started_path = tmp_path / "harness.pid"
+        harness_path = tmp_path / "codex"
+        harness_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import time\n"
+            "Path(os.environ['UNVIBE_TEST_HARNESS_PID']).write_text("
+            "str(os.getpid()))\n"
+            "time.sleep(60)\n"
+        )
+        harness_path.chmod(0o755)
+
+        env = os.environ.copy()
+        env["CODEX_BIN"] = str(harness_path)
+        env["UNVIBE_TEST_HARNESS_PID"] = str(started_path)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "unvibe",
+                str(skill_dir),
+                "--harness",
+                "codex",
+                "--evaluation-model",
+                "test-evaluator",
+                "--rubric-model",
+                "test-judge",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+
+        harness_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while not started_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert started_path.exists(), "harness did not start"
+            harness_pid = int(started_path.read_text())
+
+            os.kill(process.pid, signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=5)
+
+            assert process.returncode == 130
+            assert "Interrupted" in stderr
+            assert "Traceback" not in stderr
+            with pytest.raises(ProcessLookupError):
+                os.kill(harness_pid, 0)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            if harness_pid is not None:
+                try:
+                    os.kill(harness_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 class TestRuntimeConfiguration:
