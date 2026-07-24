@@ -17,6 +17,7 @@ import yaml
 from unvibe import cli
 from unvibe.cli import (
     DEFAULT_HARNESS_TIMEOUT_SECONDS,
+    ScenarioResult,
     build_harness_command,
     call_harness,
     create_evaluation_yaml,
@@ -25,23 +26,49 @@ from unvibe.cli import (
     main,
     parse_args,
     plan_to_searchable,
+    print_report,
     run_scenario,
     scenario_passed,
     validate_eval_spec,
 )
 
 
+class TestScenarioResult:
+    def test_defaults_capture_the_complete_result_shape(self):
+        result = ScenarioResult(id="scenario")
+
+        assert result.id == "scenario"
+        assert result.plan is None
+        assert result.raw == ""
+        assert result.must_include == []
+        assert result.must_not_include == []
+        assert result.rubric == []
+        assert result.error is None
+
+    def test_failure_constructs_a_failed_result(self):
+        result = ScenarioResult.failure(
+            "scenario",
+            "worker crashed",
+            raw="partial output",
+        )
+
+        assert result == ScenarioResult(
+            id="scenario",
+            raw="partial output",
+            error="worker crashed",
+        )
+
+
 def _result(*, error=None, must_include=None, must_not_include=None, rubric=None):
-    """Build a scenario-result dict in the shape run_scenario produces."""
-    return {
-        "id": "s",
-        "plan": [],
-        "raw": "",
-        "error": error,
-        "must_include": must_include or [],
-        "must_not_include": must_not_include or [],
-        "rubric": rubric or [],
-    }
+    """Build a ScenarioResult for pass/fail tests."""
+    return ScenarioResult(
+        id="s",
+        plan=[],
+        error=error,
+        must_include=must_include or [],
+        must_not_include=must_not_include or [],
+        rubric=rubric or [],
+    )
 
 
 class TestHarnessCommands:
@@ -556,7 +583,8 @@ class TestScenarioModels:
             ("claude", "sonnet", "high"),
             ("claude", "haiku", "high"),
         ]
-        assert result["rubric"][0]["passed"] is True
+        assert isinstance(result, ScenarioResult)
+        assert result.rubric[0]["passed"] is True
 
     def test_surfaces_evaluation_harness_error(self, monkeypatch):
         monkeypatch.setattr(
@@ -577,7 +605,8 @@ class TestScenarioModels:
             "gpt-judge",
         )
 
-        assert result["error"] == "codex timed out after 300s"
+        assert isinstance(result, ScenarioResult)
+        assert result.error == "codex timed out after 300s"
 
     def test_surfaces_rubric_harness_error(self, monkeypatch):
         responses = iter(
@@ -602,7 +631,50 @@ class TestScenarioModels:
             "gpt-judge",
         )
 
-        assert result["error"] == "judge: codex exited 7: boom"
+        assert isinstance(result, ScenarioResult)
+        assert result.error == "judge: codex exited 7: boom"
+
+
+class TestScenarioCrashHandling:
+    def test_worker_crash_becomes_a_failed_scenario_result(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Read files.")
+        (skill_dir / "EVALUATION.yaml").write_text(
+            "version: 1\n"
+            "scenarios:\n"
+            "  - id: crashes\n"
+            "    user_message: Inspect the repository.\n"
+            "    must_include:\n"
+            "      - 'Read:'\n"
+        )
+
+        def crash(*args, **kwargs):
+            raise RuntimeError("worker crashed")
+
+        monkeypatch.setattr(cli, "run_scenario", crash)
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    str(skill_dir),
+                    "--harness",
+                    "codex",
+                    "--evaluation-model",
+                    "evaluator",
+                    "--rubric-model",
+                    "judge",
+                ]
+            )
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "crashes" in captured.out
+        assert "error:" in captured.out
+        assert "worker crashed" in captured.out
+        assert "✗ crashes crashed: worker crashed" in captured.err
 
 
 class TestExtractJsonArray:
@@ -795,3 +867,19 @@ class TestScenarioPassed:
     def test_failing_rubric_fails(self):
         result = _result(rubric=[{"claim": "c", "passed": False}])
         assert scenario_passed(result) is False
+
+
+class TestPrintReport:
+    def test_success_output_is_byte_for_byte_stable(self, capsys):
+        result = _result(
+            must_include=[{"pattern": "Read:", "passed": True}],
+        )
+
+        print_report("skill", [result], verbose=False)
+
+        assert capsys.readouterr().out == (
+            "\nskill — 1 scenario(s)\n\n"
+            f"  {'s':<60} {cli.green('✓')}\n"
+            f"    {'must_include':<16} (1/1 {cli.green('✓')})\n"
+            "\n  1/1 scenarios passed\n\n"
+        )
