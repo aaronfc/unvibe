@@ -52,8 +52,11 @@ Each skill directory must contain:
 
 ```text
 SKILL.md
-EVALUATION.yaml
+EVALUATIONS.yaml
 ```
+
+Normal runs still accept the legacy `EVALUATION.yaml` filename when the plural
+file is absent, but print a deprecation warning asking you to rename it.
 
 ## Runtime configuration
 
@@ -149,7 +152,7 @@ Use `CLAUDE_BIN`, `CODEX_BIN`, or `OPENCODE_BIN` to override the corresponding
 executable. Each value is a filesystem path or command name for that harness
 binary.
 
-## Creating EVALUATION.yaml
+## Creating EVALUATIONS.yaml
 
 Use `--create` to generate a first-pass eval file from an existing `SKILL.md`:
 
@@ -158,7 +161,7 @@ bin/unvibe --create path/to/skill-dir
 ```
 
 This uses the same required runtime configuration as a normal evaluation.
-This writes `path/to/skill-dir/EVALUATION.yaml`. If that file already exists,
+This writes `path/to/skill-dir/EVALUATIONS.yaml`. If that file already exists,
 `unvibe` exits without changing it. Use `--force` to replace it:
 
 ```bash
@@ -167,7 +170,7 @@ unvibe --create path/to/skill-dir --force
 
 The generated file is a starting point. Read it before trusting it.
 
-## EVALUATION.yaml
+## EVALUATIONS.yaml
 
 ```yaml
 version: 1

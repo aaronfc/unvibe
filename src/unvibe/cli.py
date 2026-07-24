@@ -8,12 +8,12 @@ Usage:
     unvibe --create <skill-dir> --harness <name>
         --evaluation-model <model> --rubric-model <model>
 
-Normal mode reads SKILL.md and EVALUATION.yaml from <skill-dir>. For each scenario:
+Normal mode reads SKILL.md and EVALUATIONS.yaml from <skill-dir>. For each scenario:
   1. Asks the selected coding-agent harness what tool calls it would make.
   2. Checks must_include / must_not_include regex patterns.
   3. Optionally asks an LLM judge to score rubric items.
 
-Create mode reads SKILL.md and writes a first-pass EVALUATION.yaml.
+Create mode reads SKILL.md and writes a first-pass EVALUATIONS.yaml.
 
 Exits 0 if all scenarios pass, 1 otherwise, or 130 when interrupted.
 """
@@ -34,6 +34,8 @@ from typing import Any
 import yaml
 
 DEFAULT_EFFORT = "medium"
+DEFAULT_EVALUATIONS_FILENAME = "EVALUATIONS.yaml"
+LEGACY_EVALUATION_FILENAME = "EVALUATION.yaml"
 DEFAULT_HARNESS_TIMEOUT_SECONDS = 300
 HARNESS_ERROR_PREFIX = "__error__:"
 SUPPORTED_HARNESSES = ("claude", "codex", "opencode")
@@ -116,7 +118,7 @@ No prose, no markdown fences, no other text — only the JSON array.
 """
 
 CREATE_INSTRUCTIONS = """\
-You are generating an EVALUATION.yaml file for unvibe, a tiny pseudo-eval
+You are generating an EVALUATIONS.yaml file for unvibe, a tiny pseudo-eval
 runner for SKILL.md files.
 
 unvibe evaluates a skill by loading SKILL.md, showing the agent a user message,
@@ -130,7 +132,7 @@ The flattened plan looks like:
   [0] Bash: git status --short
   [1] Read: path/to/file
 
-Generate a detailed first-pass EVALUATION.yaml for the skill below.
+Generate a detailed first-pass EVALUATIONS.yaml for the skill below.
 
 Required shape:
 
@@ -179,7 +181,7 @@ Rules:
 """
 
 REPAIR_CREATE_INSTRUCTIONS = """\
-Repair this generated EVALUATION.yaml so it validates for unvibe.
+Repair this generated EVALUATIONS.yaml so it validates for unvibe.
 
 Output ONLY YAML. No prose. No markdown fences.
 
@@ -349,7 +351,7 @@ def extract_yaml_document(text: str) -> str | None:
 
 
 def validate_eval_spec(eval_spec: Any) -> None:
-    """Validate the small subset of EVALUATION.yaml that unvibe understands."""
+    """Validate the small subset of EVALUATIONS.yaml that unvibe understands."""
     if not isinstance(eval_spec, dict):
         raise ValueError("expected top-level YAML mapping")
 
@@ -409,7 +411,7 @@ def create_evaluation_yaml(
     evaluation_model: str,
     effort: str = DEFAULT_EFFORT,
 ) -> str:
-    """Ask a coding-agent harness to generate a first-pass EVALUATION.yaml."""
+    """Ask a coding-agent harness to generate a first-pass EVALUATIONS.yaml."""
     prompt = CREATE_INSTRUCTIONS + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n"
     last_error = "unknown error"
 
@@ -438,7 +440,7 @@ def create_evaluation_yaml(
                     last_error = f"generated YAML is invalid: {exc}"
                 except ValueError as exc:
                     last_error = (
-                        "generated EVALUATION.yaml did not validate: "
+                        "generated EVALUATIONS.yaml did not validate: "
                         f"{exc}"
                     )
 
@@ -797,12 +799,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--create",
         action="store_true",
-        help="Generate EVALUATION.yaml from SKILL.md",
+        help="Generate EVALUATIONS.yaml from SKILL.md",
     )
     ap.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite EVALUATION.yaml when used with --create",
+        help="Overwrite EVALUATIONS.yaml when used with --create",
     )
     ap.add_argument("--scenario", help="Run only this scenario id")
     add_runtime_options(ap)
@@ -881,6 +883,24 @@ def run_setup(args: argparse.Namespace) -> None:
     print(f"  effort: {args.effort}")
 
 
+def evaluation_path_for_run(skill_dir: Path) -> Path:
+    """Select the plural eval file, falling back to the legacy singular name."""
+    eval_path = skill_dir / DEFAULT_EVALUATIONS_FILENAME
+    if eval_path.exists():
+        return eval_path
+
+    legacy_path = skill_dir / LEGACY_EVALUATION_FILENAME
+    if legacy_path.exists():
+        print(
+            f"warning: {LEGACY_EVALUATION_FILENAME} is deprecated; "
+            f"rename it to {DEFAULT_EVALUATIONS_FILENAME}",
+            file=sys.stderr,
+        )
+        return legacy_path
+
+    return eval_path
+
+
 def _main(argv: list[str] | None = None):
     args = parse_args(argv)
     if args.command == "setup":
@@ -889,7 +909,7 @@ def _main(argv: list[str] | None = None):
 
     skill_dir = Path(args.skill_dir).resolve()
     skill_md_path = skill_dir / "SKILL.md"
-    eval_path = skill_dir / "EVALUATION.yaml"
+    eval_path = skill_dir / DEFAULT_EVALUATIONS_FILENAME
     if not skill_md_path.exists():
         sys.exit(f"error: {skill_md_path} not found")
 
@@ -910,6 +930,7 @@ def _main(argv: list[str] | None = None):
         print(f"created {eval_path}")
         return
 
+    eval_path = evaluation_path_for_run(skill_dir)
     if not eval_path.exists():
         sys.exit(f"error: {eval_path} not found")
 
