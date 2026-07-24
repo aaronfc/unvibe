@@ -8,6 +8,7 @@ evaluate scenario results — directly and offline. The smoke test
 import subprocess
 
 import pytest
+import yaml
 
 from unvibe import cli
 from unvibe.cli import (
@@ -15,6 +16,7 @@ from unvibe.cli import (
     call_harness,
     extract_json_array,
     extract_yaml_document,
+    main,
     parse_args,
     plan_to_searchable,
     run_scenario,
@@ -37,29 +39,9 @@ def _result(*, error=None, must_include=None, must_not_include=None, rubric=None
 
 
 class TestHarnessCommands:
-    @pytest.mark.parametrize(
-        ("harness", "expected"),
-        [
-            (
-                "claude",
-                ["test-claude", "-p", "--no-session-persistence", "hello"],
-            ),
-            (
-                "codex",
-                ["test-codex", "exec", "--ephemeral", "hello"],
-            ),
-            (
-                "opencode",
-                ["test-opencode", "run", "hello"],
-            ),
-        ],
-    )
-    def test_uses_native_noninteractive_command_without_model(
-        self, monkeypatch, harness, expected
-    ):
-        monkeypatch.setitem(cli.HARNESS_BINS, harness, f"test-{harness}")
-
-        assert build_harness_command(harness, "hello") == expected
+    def test_requires_explicit_model(self):
+        with pytest.raises(ValueError, match="model is required"):
+            build_harness_command("claude", "hello")
 
     @pytest.mark.parametrize(
         ("harness", "expected"),
@@ -72,6 +54,8 @@ class TestHarnessCommands:
                     "--no-session-persistence",
                     "--model",
                     "test-model",
+                    "--effort",
+                    "high",
                     "hello",
                 ],
             ),
@@ -83,6 +67,8 @@ class TestHarnessCommands:
                     "--ephemeral",
                     "--model",
                     "test-model",
+                    "-c",
+                    'model_reasoning_effort="high"',
                     "hello",
                 ],
             ),
@@ -93,6 +79,8 @@ class TestHarnessCommands:
                     "run",
                     "--model",
                     "test-model",
+                    "--variant",
+                    "high",
                     "hello",
                 ],
             ),
@@ -103,7 +91,10 @@ class TestHarnessCommands:
     ):
         monkeypatch.setitem(cli.HARNESS_BINS, harness, f"test-{harness}")
 
-        assert build_harness_command(harness, "hello", "test-model") == expected
+        assert (
+            build_harness_command(harness, "hello", "test-model", "high")
+            == expected
+        )
 
     def test_call_harness_runs_selected_adapter(self, monkeypatch):
         monkeypatch.setitem(cli.HARNESS_BINS, "codex", "test-codex")
@@ -116,7 +107,16 @@ class TestHarnessCommands:
 
         monkeypatch.setattr(cli.subprocess, "run", run)
 
-        assert call_harness("hello", "codex", "gpt-test", timeout=12) == "answer"
+        assert (
+            call_harness(
+                "hello",
+                "codex",
+                "gpt-test",
+                effort="xhigh",
+                timeout=12,
+            )
+            == "answer"
+        )
         assert observed == {
             "command": [
                 "test-codex",
@@ -124,6 +124,8 @@ class TestHarnessCommands:
                 "--ephemeral",
                 "--model",
                 "gpt-test",
+                "-c",
+                'model_reasoning_effort="xhigh"',
                 "hello",
             ],
             "kwargs": {
@@ -137,78 +139,202 @@ class TestHarnessCommands:
 
 class TestRuntimeConfiguration:
     @pytest.fixture(autouse=True)
-    def clear_runtime_environment(self, monkeypatch):
+    def clear_runtime_environment(self, monkeypatch, tmp_path):
         for name in (
             "UNVIBE_HARNESS",
             "UNVIBE_MODEL",
             "UNVIBE_EVALUATION_MODEL",
             "UNVIBE_RUBRIC_MODEL",
+            "UNVIBE_EFFORT",
         ):
             monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(
+            "UNVIBE_CONFIG", str(tmp_path / "missing-config.yaml")
+        )
 
-    def test_defaults_to_claude_and_native_models(self):
-        args = parse_args(["skill"])
+    def test_missing_configuration_explains_every_configuration_path(
+        self, capsys
+    ):
+        with pytest.raises(SystemExit):
+            parse_args(["skill"])
+
+        error = capsys.readouterr().err
+        assert "--harness" in error
+        assert "--evaluation-model" in error
+        assert "--rubric-model" in error
+        assert "UNVIBE_HARNESS" in error
+        assert "UNVIBE_EVALUATION_MODEL" in error
+        assert "UNVIBE_RUBRIC_MODEL" in error
+        assert "unvibe setup" in error
+        assert "opus" in error
+        assert "haiku" in error
+        assert "gpt-5.6-sol" in error
+        assert "gpt-5.6-luna" in error
+
+    def test_cli_configures_required_values_and_default_effort(self):
+        args = parse_args(
+            [
+                "skill",
+                "--harness",
+                "claude",
+                "--evaluation-model",
+                "opus",
+                "--rubric-model",
+                "haiku",
+            ]
+        )
 
         assert args.harness == "claude"
-        assert args.evaluation_model is None
-        assert args.rubric_model is None
+        assert args.evaluation_model == "opus"
+        assert args.rubric_model == "haiku"
+        assert args.effort == "medium"
 
-    def test_environment_configures_harness_and_both_models(self, monkeypatch):
+    def test_environment_configures_all_runtime_values(self, monkeypatch):
         monkeypatch.setenv("UNVIBE_HARNESS", "opencode")
         monkeypatch.setenv("UNVIBE_EVALUATION_MODEL", "provider/evaluator")
         monkeypatch.setenv("UNVIBE_RUBRIC_MODEL", "provider/judge")
+        monkeypatch.setenv("UNVIBE_EFFORT", "high")
 
         args = parse_args(["skill"])
 
         assert args.harness == "opencode"
         assert args.evaluation_model == "provider/evaluator"
         assert args.rubric_model == "provider/judge"
+        assert args.effort == "high"
 
-    def test_cli_overrides_environment(self, monkeypatch):
-        monkeypatch.setenv("UNVIBE_HARNESS", "opencode")
+    def test_user_config_supplies_all_runtime_values(
+        self, monkeypatch, tmp_path
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "version: 1\n"
+            "harness: codex\n"
+            "evaluation_model: gpt-5.6-sol\n"
+            "rubric_model: gpt-5.6-luna\n"
+            "effort: xhigh\n"
+        )
+        monkeypatch.setenv("UNVIBE_CONFIG", str(config_path))
+
+        args = parse_args(["skill"])
+
+        assert args.harness == "codex"
+        assert args.evaluation_model == "gpt-5.6-sol"
+        assert args.rubric_model == "gpt-5.6-luna"
+        assert args.effort == "xhigh"
+
+    def test_cli_overrides_environment_and_config(
+        self, monkeypatch, tmp_path
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "harness: claude\n"
+            "evaluation_model: config-evaluator\n"
+            "rubric_model: config-judge\n"
+            "effort: low\n"
+        )
+        monkeypatch.setenv("UNVIBE_CONFIG", str(config_path))
+        monkeypatch.setenv("UNVIBE_HARNESS", "codex")
         monkeypatch.setenv("UNVIBE_EVALUATION_MODEL", "environment-evaluator")
         monkeypatch.setenv("UNVIBE_RUBRIC_MODEL", "environment-judge")
+        monkeypatch.setenv("UNVIBE_EFFORT", "high")
 
         args = parse_args(
             [
                 "skill",
                 "--harness",
-                "codex",
+                "opencode",
                 "--evaluation-model",
-                "command-line-evaluator",
+                "cli-evaluator",
                 "--rubric-model",
-                "command-line-judge",
+                "cli-judge",
+                "--effort",
+                "max",
             ]
         )
 
-        assert args.harness == "codex"
-        assert args.evaluation_model == "command-line-evaluator"
-        assert args.rubric_model == "command-line-judge"
+        assert args.harness == "opencode"
+        assert args.evaluation_model == "cli-evaluator"
+        assert args.rubric_model == "cli-judge"
+        assert args.effort == "max"
 
-    def test_rubric_model_defaults_to_evaluation_model(self):
-        args = parse_args(
-            ["skill", "--evaluation-model", "shared-command-line-model"]
-        )
+    def test_legacy_model_flag_is_rejected(self, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(
+                [
+                    "skill",
+                    "--harness",
+                    "claude",
+                    "--evaluation-model",
+                    "opus",
+                    "--rubric-model",
+                    "haiku",
+                    "--model",
+                    "legacy-model",
+                ]
+            )
 
-        assert args.evaluation_model == "shared-command-line-model"
-        assert args.rubric_model == "shared-command-line-model"
+        assert "unrecognized arguments: --model" in capsys.readouterr().err
 
-    def test_legacy_model_flag_configures_both_models(self):
-        args = parse_args(["skill", "--model", "legacy-command-line-model"])
-
-        assert args.evaluation_model == "legacy-command-line-model"
-        assert args.rubric_model == "legacy-command-line-model"
-
-    def test_legacy_model_environment_configures_both_models(
-        self, monkeypatch
+    def test_legacy_model_environment_is_ignored(
+        self, monkeypatch, capsys
     ):
+        monkeypatch.setenv("UNVIBE_HARNESS", "claude")
         monkeypatch.setenv("UNVIBE_MODEL", "provider/legacy-model")
 
-        args = parse_args(["skill"])
+        with pytest.raises(SystemExit):
+            parse_args(["skill"])
 
-        assert args.harness == "claude"
-        assert args.evaluation_model == "provider/legacy-model"
-        assert args.rubric_model == "provider/legacy-model"
+        error = capsys.readouterr().err
+        assert "evaluation model" in error
+        assert "rubric model" in error
+
+    def test_setup_writes_explicit_configuration(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+
+        main(
+            [
+                "setup",
+                "--config",
+                str(config_path),
+                "--harness",
+                "claude",
+                "--evaluation-model",
+                "opus",
+                "--rubric-model",
+                "haiku",
+                "--effort",
+                "high",
+            ]
+        )
+
+        assert yaml.safe_load(config_path.read_text()) == {
+            "version": 1,
+            "harness": "claude",
+            "evaluation_model": "opus",
+            "rubric_model": "haiku",
+            "effort": "high",
+        }
+
+    def test_setup_prompts_for_each_required_choice(
+        self, monkeypatch, tmp_path
+    ):
+        config_path = tmp_path / "config.yaml"
+        answers = iter(
+            ["codex", "gpt-5.6-sol", "gpt-5.6-luna"]
+        )
+        monkeypatch.setattr(
+            "builtins.input", lambda prompt: next(answers)
+        )
+
+        main(["setup", "--config", str(config_path)])
+
+        assert yaml.safe_load(config_path.read_text()) == {
+            "version": 1,
+            "harness": "codex",
+            "evaluation_model": "gpt-5.6-sol",
+            "rubric_model": "gpt-5.6-luna",
+            "effort": "medium",
+        }
 
 
 class TestScenarioModels:
@@ -217,8 +343,8 @@ class TestScenarioModels:
     ):
         calls = []
 
-        def call(prompt, harness, model, timeout=180):
-            calls.append((harness, model))
+        def call(prompt, harness, model, effort, timeout=180):
+            calls.append((harness, model, effort))
             if len(calls) == 1:
                 return '[{"tool": "Read", "args": "README.md"}]'
             return '[{"verdict": "PASS", "reason": "The plan reads it."}]'
@@ -235,9 +361,13 @@ class TestScenarioModels:
             "claude",
             "sonnet",
             "haiku",
+            "high",
         )
 
-        assert calls == [("claude", "sonnet"), ("claude", "haiku")]
+        assert calls == [
+            ("claude", "sonnet", "high"),
+            ("claude", "haiku", "high"),
+        ]
         assert result["rubric"][0]["passed"] is True
 
 

@@ -30,13 +30,15 @@ the same command against your working tree.
 ## Usage
 
 ```bash
+unvibe setup
 unvibe path/to/skill-dir
 unvibe path/to/skill-dir --scenario happy_path
 unvibe path/to/skill-dir --verbose
 unvibe path/to/skill-dir --parallel 5
-unvibe path/to/skill-dir --harness codex
-unvibe path/to/skill-dir --harness opencode --evaluation-model provider/model
-unvibe path/to/skill-dir --evaluation-model sonnet --rubric-model haiku
+unvibe path/to/skill-dir \
+  --harness codex \
+  --evaluation-model gpt-5.6-sol \
+  --rubric-model gpt-5.6-luna
 unvibe --create path/to/skill-dir
 ```
 
@@ -47,41 +49,72 @@ SKILL.md
 EVALUATION.yaml
 ```
 
-## Harness and model
+## Runtime configuration
 
-`unvibe` supports the native Claude Code, Codex, and OpenCode harnesses. Claude
-Code remains the default for backward compatibility.
+`unvibe` supports the native Claude Code, Codex, and OpenCode harnesses. Every
+run requires an explicit harness, evaluation model, and rubric model. There
+are no implicit harness or model defaults.
 
 Configuration uses this precedence:
 
 ```text
---harness         > UNVIBE_HARNESS          > claude
---evaluation-model > UNVIBE_EVALUATION_MODEL > UNVIBE_MODEL > native default
---rubric-model     > UNVIBE_RUBRIC_MODEL     > resolved evaluation model
+CLI parameter > environment variable > user config
 ```
 
-For example:
+Choose the three required values interactively and save them to
+`~/.config/unvibe/config.yaml`:
 
 ```bash
-export UNVIBE_HARNESS=claude
-export UNVIBE_EVALUATION_MODEL=sonnet
-export UNVIBE_RUBRIC_MODEL=haiku
+unvibe setup
+```
+
+Or configure them without prompts:
+
+```bash
+unvibe setup \
+  --harness claude \
+  --evaluation-model opus \
+  --rubric-model haiku
+```
+
+The saved file has this shape:
+
+```yaml
+version: 1
+harness: claude
+evaluation_model: opus
+rubric_model: haiku
+effort: medium
+```
+
+Set `UNVIBE_CONFIG` or pass `--config` to use a different file. Environment
+configuration is also supported:
+
+```bash
+export UNVIBE_HARNESS=codex
+export UNVIBE_EVALUATION_MODEL=gpt-5.6-sol
+export UNVIBE_RUBRIC_MODEL=gpt-5.6-luna
+export UNVIBE_EFFORT=medium
 unvibe path/to/skill-dir
 ```
 
-Leave both models unset to inherit the selected harness's normal
-configuration. By default, rubric judging uses the resolved evaluation model;
-set `--rubric-model` or `UNVIBE_RUBRIC_MODEL` to use a cheaper or specialized
-judge. The original `--model` option remains an alias for
-`--evaluation-model`, and `UNVIBE_MODEL` remains its environment fallback.
-OpenCode models use its `provider/model` format.
+Suggested starting pairs are intentionally guidance, not defaults:
 
-The native noninteractive adapters invoke:
+| Harness | Evaluation | Rubric |
+|---|---|---|
+| Claude Code | `opus` | `haiku` |
+| Codex | `gpt-5.6-sol` | `gpt-5.6-luna` |
+
+OpenCode models use its `provider/model` format and must also be chosen
+explicitly.
+
+Effort is optional and defaults to `medium`. Configure it with `--effort`,
+`UNVIBE_EFFORT`, or the user config. It maps to the harness-native control:
 
 ```text
-claude   -p --no-session-persistence ...
-codex    exec --ephemeral ...
-opencode run ...
+claude   -> --effort
+codex    -> model_reasoning_effort
+opencode -> --variant
 ```
 
 Use `CLAUDE_BIN`, `CODEX_BIN`, or `OPENCODE_BIN` to override the corresponding
@@ -95,6 +128,7 @@ Use `--create` to generate a first-pass eval file from an existing `SKILL.md`:
 bin/unvibe --create path/to/skill-dir
 ```
 
+This uses the same required runtime configuration as a normal evaluation.
 This writes `path/to/skill-dir/EVALUATION.yaml`. If that file already exists,
 `unvibe` exits without changing it. Use `--force` to replace it:
 

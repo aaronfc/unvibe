@@ -2,8 +2,11 @@
 unvibe — Tiny pseudo-evals for SKILL.md files.
 
 Usage:
-    unvibe <skill-dir> [--harness <name>] [--evaluation-model <model>]
-    unvibe --create <skill-dir> [--harness <name>] [--evaluation-model <model>]
+    unvibe setup
+    unvibe <skill-dir> --harness <name> --evaluation-model <model>
+        --rubric-model <model> [--effort <level>]
+    unvibe --create <skill-dir> --harness <name>
+        --evaluation-model <model> --rubric-model <model>
 
 Normal mode reads SKILL.md and EVALUATION.yaml from <skill-dir>. For each scenario:
   1. Asks the selected coding-agent harness what tool calls it would make.
@@ -27,8 +30,12 @@ from typing import Any
 
 import yaml
 
-DEFAULT_HARNESS = "claude"
+DEFAULT_EFFORT = "medium"
 SUPPORTED_HARNESSES = ("claude", "codex", "opencode")
+MODEL_SUGGESTIONS = {
+    "claude": ("opus", "haiku"),
+    "codex": ("gpt-5.6-sol", "gpt-5.6-luna"),
+}
 HARNESS_BINS = {
     "claude": os.environ.get("CLAUDE_BIN", "claude"),
     "codex": os.environ.get("CODEX_BIN", "codex"),
@@ -171,27 +178,38 @@ def dim(s: str) -> str:
 
 
 def build_harness_command(
-    harness: str, prompt: str, model: str | None = None
+    harness: str,
+    prompt: str,
+    model: str | None = None,
+    effort: str = DEFAULT_EFFORT,
 ) -> list[str]:
     """Build the native noninteractive command for a supported harness."""
     if harness not in SUPPORTED_HARNESSES:
         raise ValueError(f"unsupported harness: {harness}")
+    if not model:
+        raise ValueError("model is required")
 
     command = [HARNESS_BINS[harness], *HARNESS_COMMANDS[harness]]
-    if model:
-        command.extend(["--model", model])
+    command.extend(["--model", model])
+    if harness == "claude":
+        command.extend(["--effort", effort])
+    elif harness == "codex":
+        command.extend(["-c", f'model_reasoning_effort="{effort}"'])
+    else:
+        command.extend(["--variant", effort])
     command.append(prompt)
     return command
 
 
 def call_harness(
     prompt: str,
-    harness: str = DEFAULT_HARNESS,
-    model: str | None = None,
+    harness: str,
+    model: str,
+    effort: str = DEFAULT_EFFORT,
     timeout: int = 180,
 ) -> str:
     """Invoke a coding-agent harness and return its assistant text."""
-    command = build_harness_command(harness, prompt, model)
+    command = build_harness_command(harness, prompt, model, effort)
     try:
         result = subprocess.run(
             command,
@@ -213,11 +231,6 @@ def call_harness(
             f"{result.stderr.strip()}"
         )
     return result.stdout.strip()
-
-
-def call_claude(prompt: str, timeout: int = 180) -> str:
-    """Backward-compatible wrapper for the original Claude-only API."""
-    return call_harness(prompt, "claude", timeout=timeout)
 
 
 def extract_json_array(text: str) -> list[dict[str, Any]] | None:
@@ -312,15 +325,22 @@ def validate_eval_spec(eval_spec: Any) -> None:
 
 def create_evaluation_yaml(
     skill_md: str,
-    harness: str = DEFAULT_HARNESS,
-    evaluation_model: str | None = None,
+    harness: str,
+    evaluation_model: str,
+    effort: str = DEFAULT_EFFORT,
 ) -> str:
     """Ask a coding-agent harness to generate a first-pass EVALUATION.yaml."""
     prompt = CREATE_INSTRUCTIONS + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n"
     last_error = "unknown error"
 
     for _ in range(2):
-        raw = call_harness(prompt, harness, evaluation_model, timeout=300)
+        raw = call_harness(
+            prompt,
+            harness,
+            evaluation_model,
+            effort,
+            timeout=300,
+        )
         yaml_text = extract_yaml_document(raw)
         if yaml_text is None:
             last_error = f"could not parse YAML from {harness}'s response"
@@ -369,9 +389,10 @@ def plan_to_searchable(
 def run_scenario(
     skill_md: str,
     scenario: dict[str, Any],
-    harness: str = DEFAULT_HARNESS,
-    evaluation_model: str | None = None,
-    rubric_model: str | None = None,
+    harness: str,
+    evaluation_model: str,
+    rubric_model: str,
+    effort: str = DEFAULT_EFFORT,
 ) -> dict[str, Any]:
     """Run one scenario; return a result dict."""
     user_msg = scenario["user_message"]
@@ -379,7 +400,7 @@ def run_scenario(
         NARRATE_INSTRUCTIONS
         + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n\n<USER>\n{user_msg}\n</USER>\n"
     )
-    raw = call_harness(prompt, harness, evaluation_model)
+    raw = call_harness(prompt, harness, evaluation_model, effort)
     plan = extract_json_array(raw)
 
     result: dict[str, Any] = {
@@ -393,7 +414,9 @@ def run_scenario(
     }
 
     if plan is None:
-        result["error"] = "Could not parse action plan from Claude's response"
+        result["error"] = (
+            f"Could not parse action plan from {harness}'s response"
+        )
         return result
 
     searchable = plan_to_searchable(plan)
@@ -425,8 +448,9 @@ def run_scenario(
             JUDGE_INSTRUCTIONS
             + f"\n\n<PLAN>\n{plan_json}\n</PLAN>\n\n<CLAIMS>\n{claims_block}\n</CLAIMS>\n"
         )
-        judge_model = rubric_model if rubric_model is not None else evaluation_model
-        raw_verdicts = call_harness(judge_prompt, harness, judge_model)
+        raw_verdicts = call_harness(
+            judge_prompt, harness, rubric_model, effort
+        )
         parsed = extract_json_array(raw_verdicts)
 
         if not isinstance(parsed, list) or len(parsed) != len(claims):
@@ -500,9 +524,173 @@ def print_report(skill_name: str, results: list[dict[str, Any]], verbose: bool):
     print(f"\n  {passed_count}/{len(results)} scenarios passed\n")
 
 
+def default_config_path() -> Path:
+    """Return the user configuration path, respecting XDG_CONFIG_HOME."""
+    explicit_path = os.environ.get("UNVIBE_CONFIG")
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+
+    config_root = os.environ.get("XDG_CONFIG_HOME")
+    if config_root:
+        return Path(config_root).expanduser() / "unvibe" / "config.yaml"
+    return Path.home() / ".config" / "unvibe" / "config.yaml"
+
+
+def resolve_config_path(cli_path: str | None) -> Path:
+    return Path(cli_path).expanduser() if cli_path else default_config_path()
+
+
+def load_user_config(path: Path) -> dict[str, Any]:
+    """Load and validate the small unvibe user configuration file."""
+    if not path.exists():
+        return {}
+    try:
+        loaded = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"could not read {path}: {exc}") from exc
+
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} must contain a YAML mapping")
+    if loaded.get("version", 1) != 1:
+        raise ValueError(f"{path} has an unsupported version")
+
+    for key in ("harness", "evaluation_model", "rubric_model", "effort"):
+        value = loaded.get(key)
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            raise ValueError(f"{path}: `{key}` must be a non-empty string")
+    return loaded
+
+
+def add_runtime_options(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument(
+        "--harness",
+        choices=SUPPORTED_HARNESSES,
+        help="Coding-agent harness",
+    )
+    ap.add_argument(
+        "--evaluation-model",
+        help="Model used to generate scenario plans",
+    )
+    ap.add_argument(
+        "--rubric-model",
+        help="Model used to judge rubric claims",
+    )
+    ap.add_argument(
+        "--effort",
+        help=f"Harness reasoning effort (default: {DEFAULT_EFFORT})",
+    )
+    ap.add_argument(
+        "--config",
+        help="User config file (default: ~/.config/unvibe/config.yaml)",
+    )
+
+
+def resolve_runtime_configuration(
+    args: argparse.Namespace,
+    ap: argparse.ArgumentParser,
+    *,
+    require_choices: bool,
+) -> argparse.Namespace:
+    config_path = resolve_config_path(args.config)
+    try:
+        config = load_user_config(config_path)
+    except ValueError as exc:
+        ap.error(str(exc))
+
+    args.config_path = config_path
+    args.harness = (
+        args.harness
+        or os.environ.get("UNVIBE_HARNESS")
+        or config.get("harness")
+    )
+    args.evaluation_model = (
+        args.evaluation_model
+        or os.environ.get("UNVIBE_EVALUATION_MODEL")
+        or config.get("evaluation_model")
+    )
+    args.rubric_model = (
+        args.rubric_model
+        or os.environ.get("UNVIBE_RUBRIC_MODEL")
+        or config.get("rubric_model")
+    )
+    args.effort = (
+        args.effort
+        or os.environ.get("UNVIBE_EFFORT")
+        or config.get("effort")
+        or DEFAULT_EFFORT
+    )
+
+    if args.harness and args.harness not in SUPPORTED_HARNESSES:
+        choices = ", ".join(SUPPORTED_HARNESSES)
+        ap.error(
+            f"harness must be one of: {choices} (got {args.harness!r})"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", args.effort):
+        ap.error(
+            "effort must contain only letters, numbers, dots, "
+            "underscores, or hyphens"
+        )
+
+    if require_choices:
+        missing = []
+        if not args.harness:
+            missing.append("harness")
+        if not args.evaluation_model:
+            missing.append("evaluation model")
+        if not args.rubric_model:
+            missing.append("rubric model")
+        if missing:
+            ap.error(missing_configuration_message(missing, config_path))
+    return args
+
+
+def missing_configuration_message(
+    missing: list[str], config_path: Path
+) -> str:
+    missing_text = ", ".join(missing)
+    return f"""\
+missing required configuration: {missing_text}
+
+Choose all three values with command-line parameters:
+  unvibe <skill-dir> --harness claude \\
+    --evaluation-model opus --rubric-model haiku
+
+Or save your choices to {config_path}:
+  unvibe setup --config {config_path}
+
+Or set all three environment variables:
+  UNVIBE_HARNESS
+  UNVIBE_EVALUATION_MODEL
+  UNVIBE_RUBRIC_MODEL
+
+Suggested starting pairs (suggestions, not defaults):
+  Claude/Anthropic: evaluation=opus, rubric=haiku
+  Codex/OpenAI: evaluation=gpt-5.6-sol, rubric=gpt-5.6-luna
+
+Optional effort can be set with --effort, UNVIBE_EFFORT, or setup.
+"""
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse CLI arguments and resolve CLI-over-environment configuration."""
-    ap = argparse.ArgumentParser(description=__doc__)
+    """Parse CLI arguments and resolve CLI-over-env-over-file config."""
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args and raw_args[0] == "setup":
+        ap = argparse.ArgumentParser(
+            prog="unvibe setup",
+            description="Save explicit unvibe runtime choices.",
+        )
+        add_runtime_options(ap)
+        args = ap.parse_args(raw_args[1:])
+        args.command = "setup"
+        return resolve_runtime_configuration(
+            args, ap, require_choices=False
+        )
+
+    ap = argparse.ArgumentParser(prog="unvibe", description=__doc__)
     ap.add_argument("skill_dir", help="Path to skill directory")
     ap.add_argument(
         "--create",
@@ -515,27 +703,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Overwrite EVALUATION.yaml when used with --create",
     )
     ap.add_argument("--scenario", help="Run only this scenario id")
-    ap.add_argument(
-        "--harness",
-        choices=SUPPORTED_HARNESSES,
-        help="Coding-agent harness (default: $UNVIBE_HARNESS or claude)",
-    )
-    ap.add_argument(
-        "--evaluation-model",
-        "--model",
-        dest="evaluation_model",
-        help=(
-            "Scenario model (default: $UNVIBE_EVALUATION_MODEL, "
-            "$UNVIBE_MODEL, or harness native default)"
-        ),
-    )
-    ap.add_argument(
-        "--rubric-model",
-        help=(
-            "Rubric judge model (default: $UNVIBE_RUBRIC_MODEL or "
-            "evaluation model)"
-        ),
-    )
+    add_runtime_options(ap)
     ap.add_argument(
         "--verbose",
         "-v",
@@ -548,32 +716,72 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3,
         help="Concurrent scenarios (default 3)",
     )
-    args = ap.parse_args(argv)
+    args = ap.parse_args(raw_args)
+    args.command = "run"
+    return resolve_runtime_configuration(args, ap, require_choices=True)
 
-    args.harness = (
-        args.harness or os.environ.get("UNVIBE_HARNESS") or DEFAULT_HARNESS
-    )
-    if args.harness not in SUPPORTED_HARNESSES:
-        choices = ", ".join(SUPPORTED_HARNESSES)
-        ap.error(
-            f"$UNVIBE_HARNESS must be one of: {choices} "
-            f"(got {args.harness!r})"
+
+def prompt_for_choice(label: str, suggestion: str | None = None) -> str:
+    hint = f" (suggested: {suggestion})" if suggestion else ""
+    while True:
+        try:
+            value = input(f"{label}{hint}: ").strip()
+        except EOFError:
+            sys.exit(
+                "error: setup needs an interactive terminal or explicit "
+                "--harness, --evaluation-model, and --rubric-model values"
+            )
+        if value:
+            return value
+        print(f"{label} is required.", file=sys.stderr)
+
+
+def run_setup(args: argparse.Namespace) -> None:
+    if not args.harness:
+        args.harness = prompt_for_choice(
+            "Harness (claude, codex, opencode)"
         )
-    if args.evaluation_model is None:
-        args.evaluation_model = (
-            os.environ.get("UNVIBE_EVALUATION_MODEL")
-            or os.environ.get("UNVIBE_MODEL")
-            or None
+        if args.harness not in SUPPORTED_HARNESSES:
+            choices = ", ".join(SUPPORTED_HARNESSES)
+            sys.exit(f"error: harness must be one of: {choices}")
+
+    suggestions = MODEL_SUGGESTIONS.get(args.harness, (None, None))
+    if not args.evaluation_model:
+        args.evaluation_model = prompt_for_choice(
+            "Evaluation model", suggestions[0]
         )
-    if args.rubric_model is None:
-        args.rubric_model = (
-            os.environ.get("UNVIBE_RUBRIC_MODEL") or args.evaluation_model
+    if not args.rubric_model:
+        args.rubric_model = prompt_for_choice(
+            "Rubric model", suggestions[1]
         )
-    return args
+
+    config = {
+        "version": 1,
+        "harness": args.harness,
+        "evaluation_model": args.evaluation_model,
+        "rubric_model": args.rubric_model,
+        "effort": args.effort,
+    }
+    try:
+        args.config_path.parent.mkdir(parents=True, exist_ok=True)
+        args.config_path.write_text(
+            yaml.safe_dump(config, sort_keys=False)
+        )
+    except OSError as exc:
+        sys.exit(f"error: could not write {args.config_path}: {exc}")
+
+    print(f"saved configuration to {args.config_path}")
+    print(f"  harness: {args.harness}")
+    print(f"  evaluation model: {args.evaluation_model}")
+    print(f"  rubric model: {args.rubric_model}")
+    print(f"  effort: {args.effort}")
 
 
 def main(argv: list[str] | None = None):
     args = parse_args(argv)
+    if args.command == "setup":
+        run_setup(args)
+        return
 
     skill_dir = Path(args.skill_dir).resolve()
     skill_md_path = skill_dir / "SKILL.md"
@@ -588,7 +796,12 @@ def main(argv: list[str] | None = None):
             )
         skill_md = skill_md_path.read_text()
         eval_path.write_text(
-            create_evaluation_yaml(skill_md, args.harness, args.evaluation_model)
+            create_evaluation_yaml(
+                skill_md,
+                args.harness,
+                args.evaluation_model,
+                args.effort,
+            )
         )
         print(f"created {eval_path}")
         return
@@ -604,7 +817,13 @@ def main(argv: list[str] | None = None):
         if not scenarios:
             sys.exit(f"error: no scenario with id '{args.scenario}'")
 
-    print(f"Running {len(scenarios)} scenario(s) against {skill_dir.name}", file=sys.stderr)
+    print(
+        f"Running {len(scenarios)} scenario(s) against {skill_dir.name} "
+        f"with {args.harness} "
+        f"(evaluation={args.evaluation_model}, "
+        f"rubric={args.rubric_model}, effort={args.effort})",
+        file=sys.stderr,
+    )
 
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=args.parallel) as ex:
@@ -616,6 +835,7 @@ def main(argv: list[str] | None = None):
                 args.harness,
                 args.evaluation_model,
                 args.rubric_model,
+                args.effort,
             ): s
             for s in scenarios
         }
