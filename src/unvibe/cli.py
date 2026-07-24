@@ -31,6 +31,8 @@ from typing import Any
 import yaml
 
 DEFAULT_EFFORT = "medium"
+DEFAULT_HARNESS_TIMEOUT_SECONDS = 300
+HARNESS_ERROR_PREFIX = "__error__:"
 SUPPORTED_HARNESSES = ("claude", "codex", "opencode")
 MODEL_SUGGESTIONS = {
     "claude": ("opus", "haiku"),
@@ -206,7 +208,7 @@ def call_harness(
     harness: str,
     model: str,
     effort: str = DEFAULT_EFFORT,
-    timeout: int = 180,
+    timeout: int = DEFAULT_HARNESS_TIMEOUT_SECONDS,
 ) -> str:
     """Invoke a coding-agent harness and return its assistant text."""
     command = build_harness_command(harness, prompt, model, effort)
@@ -224,13 +226,20 @@ def call_harness(
             f"error: '{binary}' not on PATH. Set ${HARNESS_BIN_ENV[harness]}."
         )
     except subprocess.TimeoutExpired:
-        return ""
+        return f"{HARNESS_ERROR_PREFIX} {harness} timed out after {timeout}s"
     if result.returncode != 0:
         return (
-            f"__error__: {harness} exited {result.returncode}: "
+            f"{HARNESS_ERROR_PREFIX} {harness} exited {result.returncode}: "
             f"{result.stderr.strip()}"
         )
     return result.stdout.strip()
+
+
+def harness_error_message(text: str) -> str | None:
+    """Return the readable message from an explicit harness error."""
+    if not text.startswith(HARNESS_ERROR_PREFIX):
+        return None
+    return text.removeprefix(HARNESS_ERROR_PREFIX).strip()
 
 
 def extract_json_array(text: str) -> list[dict[str, Any]] | None:
@@ -238,7 +247,7 @@ def extract_json_array(text: str) -> list[dict[str, Any]] | None:
 
     Handles bare JSON, fenced JSON, and JSON with leading/trailing prose.
     """
-    if not text or text.startswith("__error__"):
+    if not text or text.startswith(HARNESS_ERROR_PREFIX):
         return None
     fence = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
     if fence:
@@ -255,7 +264,7 @@ def extract_json_array(text: str) -> list[dict[str, Any]] | None:
 
 def extract_yaml_document(text: str) -> str | None:
     """Pull a YAML document out of a model response."""
-    if not text or text.startswith("__error__"):
+    if not text or text.startswith(HARNESS_ERROR_PREFIX):
         return None
     fence = re.search(r"```(?:ya?ml)?\s*(.*?)\s*```", text, re.DOTALL)
     if fence:
@@ -339,20 +348,28 @@ def create_evaluation_yaml(
             harness,
             evaluation_model,
             effort,
-            timeout=300,
+            timeout=DEFAULT_HARNESS_TIMEOUT_SECONDS,
         )
-        yaml_text = extract_yaml_document(raw)
-        if yaml_text is None:
-            last_error = f"could not parse YAML from {harness}'s response"
+        invocation_error = harness_error_message(raw)
+        yaml_text = None
+        if invocation_error:
+            last_error = invocation_error
         else:
-            try:
-                eval_spec = yaml.safe_load(yaml_text)
-                validate_eval_spec(eval_spec)
-                return yaml_text
-            except yaml.YAMLError as exc:
-                last_error = f"generated YAML is invalid: {exc}"
-            except ValueError as exc:
-                last_error = f"generated EVALUATION.yaml did not validate: {exc}"
+            yaml_text = extract_yaml_document(raw)
+            if yaml_text is None:
+                last_error = f"could not parse YAML from {harness}'s response"
+            else:
+                try:
+                    eval_spec = yaml.safe_load(yaml_text)
+                    validate_eval_spec(eval_spec)
+                    return yaml_text
+                except yaml.YAMLError as exc:
+                    last_error = f"generated YAML is invalid: {exc}"
+                except ValueError as exc:
+                    last_error = (
+                        "generated EVALUATION.yaml did not validate: "
+                        f"{exc}"
+                    )
 
         prompt = (
             REPAIR_CREATE_INSTRUCTIONS
@@ -413,6 +430,11 @@ def run_scenario(
         "error": None,
     }
 
+    invocation_error = harness_error_message(raw)
+    if invocation_error:
+        result["error"] = invocation_error
+        return result
+
     if plan is None:
         result["error"] = (
             f"Could not parse action plan from {harness}'s response"
@@ -452,6 +474,11 @@ def run_scenario(
             judge_prompt, harness, rubric_model, effort
         )
         parsed = extract_json_array(raw_verdicts)
+
+        invocation_error = harness_error_message(raw_verdicts)
+        if invocation_error:
+            result["error"] = f"judge: {invocation_error}"
+            return result
 
         if not isinstance(parsed, list) or len(parsed) != len(claims):
             err = f"judge returned malformed response (got {type(parsed).__name__}, expected list of {len(claims)}): {raw_verdicts[:200]}"

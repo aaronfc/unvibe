@@ -12,8 +12,10 @@ import yaml
 
 from unvibe import cli
 from unvibe.cli import (
+    DEFAULT_HARNESS_TIMEOUT_SECONDS,
     build_harness_command,
     call_harness,
+    create_evaluation_yaml,
     extract_json_array,
     extract_yaml_document,
     main,
@@ -135,6 +137,35 @@ class TestHarnessCommands:
                 "check": False,
             },
         }
+
+    def test_call_harness_reports_timeout_with_harness_and_duration(
+        self, monkeypatch
+    ):
+        def run(command, **kwargs):
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        monkeypatch.setattr(cli.subprocess, "run", run)
+
+        assert call_harness("hello", "codex", "gpt-test") == (
+            "__error__: codex timed out after 300s"
+        )
+        assert DEFAULT_HARNESS_TIMEOUT_SECONDS == 300
+
+    def test_create_surfaces_harness_error(self, monkeypatch):
+        monkeypatch.setattr(
+            cli,
+            "call_harness",
+            lambda *args, **kwargs: "__error__: codex timed out after 300s",
+        )
+
+        with pytest.raises(
+            SystemExit, match="codex timed out after 300s"
+        ):
+            create_evaluation_yaml(
+                "skill instructions",
+                "codex",
+                "gpt-test",
+            )
 
 
 class TestRuntimeConfiguration:
@@ -369,6 +400,52 @@ class TestScenarioModels:
             ("claude", "haiku", "high"),
         ]
         assert result["rubric"][0]["passed"] is True
+
+    def test_surfaces_evaluation_harness_error(self, monkeypatch):
+        monkeypatch.setattr(
+            cli,
+            "call_harness",
+            lambda *args, **kwargs: "__error__: codex timed out after 300s",
+        )
+
+        result = run_scenario(
+            "skill instructions",
+            {
+                "id": "reads_docs",
+                "user_message": "Read the docs",
+                "must_include": ["Read:"],
+            },
+            "codex",
+            "gpt-evaluator",
+            "gpt-judge",
+        )
+
+        assert result["error"] == "codex timed out after 300s"
+
+    def test_surfaces_rubric_harness_error(self, monkeypatch):
+        responses = iter(
+            [
+                '[{"tool": "Read", "args": "README.md"}]',
+                "__error__: codex exited 7: boom",
+            ]
+        )
+        monkeypatch.setattr(
+            cli, "call_harness", lambda *args, **kwargs: next(responses)
+        )
+
+        result = run_scenario(
+            "skill instructions",
+            {
+                "id": "reads_docs",
+                "user_message": "Read the docs",
+                "rubric": ["The plan reads the documentation."],
+            },
+            "codex",
+            "gpt-evaluator",
+            "gpt-judge",
+        )
+
+        assert result["error"] == "judge: codex exited 7: boom"
 
 
 class TestExtractJsonArray:
