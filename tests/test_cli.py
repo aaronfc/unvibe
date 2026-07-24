@@ -346,19 +346,26 @@ class TestRuntimeConfiguration:
             "effort": "high",
         }
 
-    def test_setup_prompts_for_each_required_choice(
+    def test_setup_accepts_suggested_models_with_empty_responses(
         self, monkeypatch, tmp_path
     ):
         config_path = tmp_path / "config.yaml"
-        answers = iter(
-            ["codex", "gpt-5.6-sol", "gpt-5.6-luna"]
-        )
-        monkeypatch.setattr(
-            "builtins.input", lambda prompt: next(answers)
-        )
+        answers = iter(["codex", "", ""])
+        prompts = []
+
+        def answer(prompt):
+            prompts.append(prompt)
+            return next(answers)
+
+        monkeypatch.setattr("builtins.input", answer)
 
         main(["setup", "--config", str(config_path)])
 
+        assert prompts == [
+            "Harness (claude, codex, opencode): ",
+            "Evaluation model (default: gpt-5.6-sol): ",
+            "Rubric model (default: gpt-5.6-luna): ",
+        ]
         assert yaml.safe_load(config_path.read_text()) == {
             "version": 1,
             "harness": "codex",

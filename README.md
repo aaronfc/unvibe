@@ -58,8 +58,8 @@ EVALUATION.yaml
 ## Runtime configuration
 
 `unvibe` supports the native Claude Code, Codex, and OpenCode harnesses. Every
-run requires an explicit harness, evaluation model, and rubric model. There
-are no implicit harness or model defaults.
+run requires a configured harness, evaluation model, and rubric model. Normal
+runs have no implicit harness or model defaults.
 
 ### First-time setup
 
@@ -69,10 +69,12 @@ Choose the three required values interactively:
 unvibe setup
 ```
 
-The prompts show suggested model pairs, but pressing Enter does not accept an
-implicit model; you must make each choice. Setup saves the result to
-`~/.config/unvibe/config.yaml`, or to
-`$XDG_CONFIG_HOME/unvibe/config.yaml` when `XDG_CONFIG_HOME` is set.
+After you choose Claude or Codex, setup still asks for both models and shows
+the suggested pair as defaults. Press Enter to accept each default, or type a
+different model. OpenCode models remain explicit because they are
+provider-specific. Setup saves the result to
+`~/.config/unvibe/config.yaml`, or to `$XDG_CONFIG_HOME/unvibe/config.yaml`
+when `XDG_CONFIG_HOME` is set.
 
 To configure without prompts:
 
@@ -137,9 +139,10 @@ Model and effort values are passed to the selected harness:
 | Codex | Model slug accepted by `codex --model`, such as `gpt-5.6-sol` | `gpt-5.6-sol` / `gpt-5.6-luna` | `model_reasoning_effort`; `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`, subject to model/account support |
 | OpenCode | Required `provider/model` form accepted by `opencode --model` | Provider-specific | `opencode --variant`; values are provider/model-specific |
 
-The model suggestions are guidance, not defaults. Model availability can vary
-by harness version and account. `unvibe` passes model and effort strings
-through; the selected harness reports unsupported values.
+The suggested pairs are defaults only in the interactive setup prompts; normal
+runs never select models implicitly. Model availability can vary by harness
+version and account. `unvibe` passes model and effort strings through; the
+selected harness reports unsupported values.
 
 Use `CLAUDE_BIN`, `CODEX_BIN`, or `OPENCODE_BIN` to override the corresponding
 executable. Each value is a filesystem path or command name for that harness

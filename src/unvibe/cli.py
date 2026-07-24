@@ -748,8 +748,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return resolve_runtime_configuration(args, ap, require_choices=True)
 
 
-def prompt_for_choice(label: str, suggestion: str | None = None) -> str:
-    hint = f" (suggested: {suggestion})" if suggestion else ""
+def prompt_for_choice(label: str, default: str | None = None) -> str:
+    hint = f" (default: {default})" if default else ""
     while True:
         try:
             value = input(f"{label}{hint}: ").strip()
@@ -760,6 +760,8 @@ def prompt_for_choice(label: str, suggestion: str | None = None) -> str:
             )
         if value:
             return value
+        if default:
+            return default
         print(f"{label} is required.", file=sys.stderr)
 
 
