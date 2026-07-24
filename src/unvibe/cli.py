@@ -2,11 +2,11 @@
 unvibe — Tiny pseudo-evals for SKILL.md files.
 
 Usage:
-    unvibe <skill-dir> [--scenario <id>] [--verbose]
-    unvibe --create <skill-dir> [--force]
+    unvibe <skill-dir> [--harness <name>] [--model <model>]
+    unvibe --create <skill-dir> [--harness <name>] [--model <model>]
 
 Normal mode reads SKILL.md and EVALUATION.yaml from <skill-dir>. For each scenario:
-  1. Asks Claude (narrate-only) what tool calls it would make.
+  1. Asks the selected coding-agent harness what tool calls it would make.
   2. Checks must_include / must_not_include regex patterns.
   3. Optionally asks an LLM judge to score rubric items.
 
@@ -27,7 +27,23 @@ from typing import Any
 
 import yaml
 
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+DEFAULT_HARNESS = "claude"
+SUPPORTED_HARNESSES = ("claude", "codex", "opencode")
+HARNESS_BINS = {
+    "claude": os.environ.get("CLAUDE_BIN", "claude"),
+    "codex": os.environ.get("CODEX_BIN", "codex"),
+    "opencode": os.environ.get("OPENCODE_BIN", "opencode"),
+}
+HARNESS_BIN_ENV = {
+    "claude": "CLAUDE_BIN",
+    "codex": "CODEX_BIN",
+    "opencode": "OPENCODE_BIN",
+}
+HARNESS_COMMANDS = {
+    "claude": ("-p", "--no-session-persistence"),
+    "codex": ("exec", "--ephemeral"),
+    "opencode": ("run",),
+}
 NARRATE_INSTRUCTIONS = """\
 You are evaluating a skill. Below in the <SKILL> block is the skill's full
 instructions. In the <USER> block is a user message.
@@ -154,23 +170,54 @@ def dim(s: str) -> str:
     return f"\033[2m{s}\033[0m"
 
 
-def call_claude(prompt: str, timeout: int = 180) -> str:
-    """Invoke `claude -p` and return the assistant text."""
+def build_harness_command(
+    harness: str, prompt: str, model: str | None = None
+) -> list[str]:
+    """Build the native noninteractive command for a supported harness."""
+    if harness not in SUPPORTED_HARNESSES:
+        raise ValueError(f"unsupported harness: {harness}")
+
+    command = [HARNESS_BINS[harness], *HARNESS_COMMANDS[harness]]
+    if model:
+        command.extend(["--model", model])
+    command.append(prompt)
+    return command
+
+
+def call_harness(
+    prompt: str,
+    harness: str = DEFAULT_HARNESS,
+    model: str | None = None,
+    timeout: int = 180,
+) -> str:
+    """Invoke a coding-agent harness and return its assistant text."""
+    command = build_harness_command(harness, prompt, model)
     try:
         result = subprocess.run(
-            [CLAUDE_BIN, "-p", prompt],
+            command,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
         )
     except FileNotFoundError:
-        sys.exit(f"error: '{CLAUDE_BIN}' not on PATH. Set $CLAUDE_BIN.")
+        binary = HARNESS_BINS[harness]
+        sys.exit(
+            f"error: '{binary}' not on PATH. Set ${HARNESS_BIN_ENV[harness]}."
+        )
     except subprocess.TimeoutExpired:
         return ""
     if result.returncode != 0:
-        return f"__error__: claude exited {result.returncode}: {result.stderr.strip()}"
+        return (
+            f"__error__: {harness} exited {result.returncode}: "
+            f"{result.stderr.strip()}"
+        )
     return result.stdout.strip()
+
+
+def call_claude(prompt: str, timeout: int = 180) -> str:
+    """Backward-compatible wrapper for the original Claude-only API."""
+    return call_harness(prompt, "claude", timeout=timeout)
 
 
 def extract_json_array(text: str) -> list[dict[str, Any]] | None:
@@ -263,16 +310,20 @@ def validate_eval_spec(eval_spec: Any) -> None:
             )
 
 
-def create_evaluation_yaml(skill_md: str) -> str:
-    """Ask Claude to generate a first-pass EVALUATION.yaml for a skill."""
+def create_evaluation_yaml(
+    skill_md: str,
+    harness: str = DEFAULT_HARNESS,
+    model: str | None = None,
+) -> str:
+    """Ask a coding-agent harness to generate a first-pass EVALUATION.yaml."""
     prompt = CREATE_INSTRUCTIONS + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n"
     last_error = "unknown error"
 
     for _ in range(2):
-        raw = call_claude(prompt, timeout=300)
+        raw = call_harness(prompt, harness, model, timeout=300)
         yaml_text = extract_yaml_document(raw)
         if yaml_text is None:
-            last_error = "could not parse YAML from Claude's response"
+            last_error = f"could not parse YAML from {harness}'s response"
         else:
             try:
                 eval_spec = yaml.safe_load(yaml_text)
@@ -315,14 +366,19 @@ def plan_to_searchable(
     return "\n".join(parts)
 
 
-def run_scenario(skill_md: str, scenario: dict[str, Any]) -> dict[str, Any]:
+def run_scenario(
+    skill_md: str,
+    scenario: dict[str, Any],
+    harness: str = DEFAULT_HARNESS,
+    model: str | None = None,
+) -> dict[str, Any]:
     """Run one scenario; return a result dict."""
     user_msg = scenario["user_message"]
     prompt = (
         NARRATE_INSTRUCTIONS
         + f"\n\n<SKILL>\n{skill_md}\n</SKILL>\n\n<USER>\n{user_msg}\n</USER>\n"
     )
-    raw = call_claude(prompt)
+    raw = call_harness(prompt, harness, model)
     plan = extract_json_array(raw)
 
     result: dict[str, Any] = {
@@ -368,7 +424,7 @@ def run_scenario(skill_md: str, scenario: dict[str, Any]) -> dict[str, Any]:
             JUDGE_INSTRUCTIONS
             + f"\n\n<PLAN>\n{plan_json}\n</PLAN>\n\n<CLAIMS>\n{claims_block}\n</CLAIMS>\n"
         )
-        raw_verdicts = call_claude(judge_prompt)
+        raw_verdicts = call_harness(judge_prompt, harness, model)
         parsed = extract_json_array(raw_verdicts)
 
         if not isinstance(parsed, list) or len(parsed) != len(claims):
@@ -442,7 +498,8 @@ def print_report(skill_name: str, results: list[dict[str, Any]], verbose: bool):
     print(f"\n  {passed_count}/{len(results)} scenarios passed\n")
 
 
-def main():
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments and resolve CLI-over-environment configuration."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("skill_dir", help="Path to skill directory")
     ap.add_argument(
@@ -456,9 +513,45 @@ def main():
         help="Overwrite EVALUATION.yaml when used with --create",
     )
     ap.add_argument("--scenario", help="Run only this scenario id")
-    ap.add_argument("--verbose", "-v", action="store_true", help="Show passing assertions + full plan")
-    ap.add_argument("--parallel", type=int, default=3, help="Concurrent scenarios (default 3)")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--harness",
+        choices=SUPPORTED_HARNESSES,
+        help="Coding-agent harness (default: $UNVIBE_HARNESS or claude)",
+    )
+    ap.add_argument(
+        "--model",
+        help="Harness model (default: $UNVIBE_MODEL or harness native default)",
+    )
+    ap.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show passing assertions + full plan",
+    )
+    ap.add_argument(
+        "--parallel",
+        type=int,
+        default=3,
+        help="Concurrent scenarios (default 3)",
+    )
+    args = ap.parse_args(argv)
+
+    args.harness = (
+        args.harness or os.environ.get("UNVIBE_HARNESS") or DEFAULT_HARNESS
+    )
+    if args.harness not in SUPPORTED_HARNESSES:
+        choices = ", ".join(SUPPORTED_HARNESSES)
+        ap.error(
+            f"$UNVIBE_HARNESS must be one of: {choices} "
+            f"(got {args.harness!r})"
+        )
+    if args.model is None:
+        args.model = os.environ.get("UNVIBE_MODEL") or None
+    return args
+
+
+def main(argv: list[str] | None = None):
+    args = parse_args(argv)
 
     skill_dir = Path(args.skill_dir).resolve()
     skill_md_path = skill_dir / "SKILL.md"
@@ -472,7 +565,9 @@ def main():
                 f"error: {eval_path} already exists. Use --force to overwrite it."
             )
         skill_md = skill_md_path.read_text()
-        eval_path.write_text(create_evaluation_yaml(skill_md))
+        eval_path.write_text(
+            create_evaluation_yaml(skill_md, args.harness, args.model)
+        )
         print(f"created {eval_path}")
         return
 
@@ -491,7 +586,16 @@ def main():
 
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=args.parallel) as ex:
-        futures = {ex.submit(run_scenario, skill_md, s): s for s in scenarios}
+        futures = {
+            ex.submit(
+                run_scenario,
+                skill_md,
+                s,
+                args.harness,
+                args.model,
+            ): s
+            for s in scenarios
+        }
         for fut in as_completed(futures):
             s = futures[fut]
             try:

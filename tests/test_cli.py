@@ -1,15 +1,21 @@
 """Unit tests for the pure functions in unvibe.cli.
 
 These exercise the functions that pull structured data out of model output and
-evaluate scenario results — directly, offline, with no `claude`/`CLAUDE_BIN`
-subprocess. The smoke test (tests/smoke.sh) covers packaging and CLI wiring.
+evaluate scenario results — directly and offline. The smoke test
+(tests/smoke.sh) covers packaging and CLI wiring.
 """
+
+import subprocess
 
 import pytest
 
+from unvibe import cli
 from unvibe.cli import (
+    build_harness_command,
+    call_harness,
     extract_json_array,
     extract_yaml_document,
+    parse_args,
     plan_to_searchable,
     scenario_passed,
     validate_eval_spec,
@@ -27,6 +33,136 @@ def _result(*, error=None, must_include=None, must_not_include=None, rubric=None
         "must_not_include": must_not_include or [],
         "rubric": rubric or [],
     }
+
+
+class TestHarnessCommands:
+    @pytest.mark.parametrize(
+        ("harness", "expected"),
+        [
+            (
+                "claude",
+                ["test-claude", "-p", "--no-session-persistence", "hello"],
+            ),
+            (
+                "codex",
+                ["test-codex", "exec", "--ephemeral", "hello"],
+            ),
+            (
+                "opencode",
+                ["test-opencode", "run", "hello"],
+            ),
+        ],
+    )
+    def test_uses_native_noninteractive_command_without_model(
+        self, monkeypatch, harness, expected
+    ):
+        monkeypatch.setitem(cli.HARNESS_BINS, harness, f"test-{harness}")
+
+        assert build_harness_command(harness, "hello") == expected
+
+    @pytest.mark.parametrize(
+        ("harness", "expected"),
+        [
+            (
+                "claude",
+                [
+                    "test-claude",
+                    "-p",
+                    "--no-session-persistence",
+                    "--model",
+                    "test-model",
+                    "hello",
+                ],
+            ),
+            (
+                "codex",
+                [
+                    "test-codex",
+                    "exec",
+                    "--ephemeral",
+                    "--model",
+                    "test-model",
+                    "hello",
+                ],
+            ),
+            (
+                "opencode",
+                [
+                    "test-opencode",
+                    "run",
+                    "--model",
+                    "test-model",
+                    "hello",
+                ],
+            ),
+        ],
+    )
+    def test_passes_explicit_model_to_selected_harness(
+        self, monkeypatch, harness, expected
+    ):
+        monkeypatch.setitem(cli.HARNESS_BINS, harness, f"test-{harness}")
+
+        assert build_harness_command(harness, "hello", "test-model") == expected
+
+    def test_call_harness_runs_selected_adapter(self, monkeypatch):
+        monkeypatch.setitem(cli.HARNESS_BINS, "codex", "test-codex")
+        observed = {}
+
+        def run(command, **kwargs):
+            observed["command"] = command
+            observed["kwargs"] = kwargs
+            return subprocess.CompletedProcess(command, 0, stdout="answer\n", stderr="")
+
+        monkeypatch.setattr(cli.subprocess, "run", run)
+
+        assert call_harness("hello", "codex", "gpt-test", timeout=12) == "answer"
+        assert observed == {
+            "command": [
+                "test-codex",
+                "exec",
+                "--ephemeral",
+                "--model",
+                "gpt-test",
+                "hello",
+            ],
+            "kwargs": {
+                "capture_output": True,
+                "text": True,
+                "timeout": 12,
+                "check": False,
+            },
+        }
+
+
+class TestRuntimeConfiguration:
+    def test_defaults_to_claude_and_native_model(self, monkeypatch):
+        monkeypatch.delenv("UNVIBE_HARNESS", raising=False)
+        monkeypatch.delenv("UNVIBE_MODEL", raising=False)
+
+        args = parse_args(["skill"])
+
+        assert args.harness == "claude"
+        assert args.model is None
+
+    def test_environment_configures_harness_and_model(self, monkeypatch):
+        monkeypatch.setenv("UNVIBE_HARNESS", "opencode")
+        monkeypatch.setenv("UNVIBE_MODEL", "provider/model")
+
+        args = parse_args(["skill"])
+
+        assert args.harness == "opencode"
+        assert args.model == "provider/model"
+
+    def test_cli_overrides_environment(self, monkeypatch):
+        monkeypatch.setenv("UNVIBE_HARNESS", "opencode")
+        monkeypatch.setenv("UNVIBE_MODEL", "provider/environment-model")
+
+        args = parse_args(
+            ["skill", "--harness", "codex", "--model", "command-line-model"]
+        )
+
+        assert args.harness == "codex"
+        assert args.model == "command-line-model"
 
 
 class TestExtractJsonArray:
