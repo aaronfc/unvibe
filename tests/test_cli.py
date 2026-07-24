@@ -238,7 +238,7 @@ class TestInterruptHandling:
         skill_dir = tmp_path / "skill"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("Always inspect README.md.\n")
-        (skill_dir / "EVALUATION.yaml").write_text(
+        (skill_dir / "EVALUATIONS.yaml").write_text(
             "version: 1\n"
             "scenarios:\n"
             "  - id: waiting\n"
@@ -552,6 +552,99 @@ class TestRuntimeConfiguration:
         }
 
 
+class TestEvaluationFilename:
+    @staticmethod
+    def runtime_args(skill_dir):
+        return [
+            str(skill_dir),
+            "--harness",
+            "codex",
+            "--evaluation-model",
+            "evaluator",
+            "--rubric-model",
+            "judge",
+        ]
+
+    @staticmethod
+    def write_spec(path, scenario_id):
+        path.write_text(
+            "version: 1\n"
+            "scenarios:\n"
+            f"  - id: {scenario_id}\n"
+            "    user_message: Inspect the repository.\n"
+            "    must_include:\n"
+            "      - 'Read:'\n"
+        )
+
+    def test_prefers_plural_evaluations_file(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Read files.")
+        self.write_spec(skill_dir / "EVALUATIONS.yaml", "plural")
+        self.write_spec(skill_dir / "EVALUATION.yaml", "legacy")
+        monkeypatch.setattr(
+            cli,
+            "run_scenario",
+            lambda skill, scenario, *args: ScenarioResult(
+                id=scenario["id"]
+            ),
+        )
+
+        with pytest.raises(SystemExit, match="0"):
+            main(self.runtime_args(skill_dir))
+
+        captured = capsys.readouterr()
+        assert "plural" in captured.out
+        assert "legacy" not in captured.out
+        assert "warning:" not in captured.err
+
+    def test_falls_back_to_singular_evaluation_file_with_warning(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Read files.")
+        self.write_spec(skill_dir / "EVALUATION.yaml", "legacy")
+        monkeypatch.setattr(
+            cli,
+            "run_scenario",
+            lambda skill, scenario, *args: ScenarioResult(
+                id=scenario["id"]
+            ),
+        )
+
+        with pytest.raises(SystemExit, match="0"):
+            main(self.runtime_args(skill_dir))
+
+        captured = capsys.readouterr()
+        assert "legacy" in captured.out
+        assert "warning:" in captured.err
+        assert "EVALUATION.yaml is deprecated" in captured.err
+        assert "rename it to EVALUATIONS.yaml" in captured.err
+
+    def test_create_writes_plural_evaluations_file(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Read files.")
+        monkeypatch.setattr(
+            cli,
+            "create_evaluation_yaml",
+            lambda *args: "version: 1\nscenarios: []\n",
+        )
+
+        main(["--create", *self.runtime_args(skill_dir)])
+
+        assert (skill_dir / "EVALUATIONS.yaml").read_text() == (
+            "version: 1\nscenarios: []\n"
+        )
+        assert not (skill_dir / "EVALUATION.yaml").exists()
+        assert "created" in capsys.readouterr().out
+
+
 class TestScenarioModels:
     def test_uses_evaluation_model_for_plan_and_rubric_model_for_judge(
         self, monkeypatch
@@ -642,7 +735,7 @@ class TestScenarioCrashHandling:
         skill_dir = tmp_path / "skill"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("Read files.")
-        (skill_dir / "EVALUATION.yaml").write_text(
+        (skill_dir / "EVALUATIONS.yaml").write_text(
             "version: 1\n"
             "scenarios:\n"
             "  - id: crashes\n"
@@ -719,7 +812,7 @@ class TestExtractYamlDocument:
         assert extract_yaml_document(text) == "version: 1\nscenarios: []\n"
 
     def test_prose_prefixed_is_anchored_to_version_marker(self):
-        text = "Here is the EVALUATION.yaml you asked for:\nversion: 1\nscenarios:\n  - id: a\n"
+        text = "Here is the EVALUATIONS.yaml you asked for:\nversion: 1\nscenarios:\n  - id: a\n"
         assert extract_yaml_document(text) == "version: 1\nscenarios:\n  - id: a\n"
 
     def test_marker_anchored_to_scenarios_when_version_absent(self):
