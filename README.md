@@ -14,6 +14,7 @@ intentionally small.
 Run it without installing anything:
 
 ```bash
+uvx --from git+https://github.com/aaronfc/unvibe.git unvibe setup
 uvx --from git+https://github.com/aaronfc/unvibe.git unvibe path/to/skill-dir
 ```
 
@@ -21,11 +22,16 @@ Or install it as a persistent tool:
 
 ```bash
 uv tool install git+https://github.com/aaronfc/unvibe.git
+unvibe setup
 unvibe path/to/skill-dir
 ```
 
 From a local checkout, `uv run unvibe ...` (or the `bin/unvibe` wrapper) runs
 the same command against your working tree.
+
+Before running an evaluation, install and authenticate at least one supported
+harness: Claude Code, Codex, or OpenCode. `unvibe` invokes that harness's local
+CLI; it does not manage the harness installation or login.
 
 ## Usage
 
@@ -55,29 +61,30 @@ EVALUATION.yaml
 run requires an explicit harness, evaluation model, and rubric model. There
 are no implicit harness or model defaults.
 
-Configuration uses this precedence:
+### First-time setup
 
-```text
-CLI parameter > environment variable > user config
-```
-
-Choose the three required values interactively and save them to
-`~/.config/unvibe/config.yaml`:
+Choose the three required values interactively:
 
 ```bash
 unvibe setup
 ```
 
-Or configure them without prompts:
+The prompts show suggested model pairs, but pressing Enter does not accept an
+implicit model; you must make each choice. Setup saves the result to
+`~/.config/unvibe/config.yaml`, or to
+`$XDG_CONFIG_HOME/unvibe/config.yaml` when `XDG_CONFIG_HOME` is set.
+
+To configure without prompts:
 
 ```bash
 unvibe setup \
   --harness claude \
   --evaluation-model opus \
-  --rubric-model haiku
+  --rubric-model haiku \
+  --effort medium
 ```
 
-The saved file has this shape:
+You can also write the YAML file directly:
 
 ```yaml
 version: 1
@@ -87,8 +94,16 @@ rubric_model: haiku
 effort: medium
 ```
 
-Set `UNVIBE_CONFIG` or pass `--config` to use a different file. Environment
-configuration is also supported:
+Set `UNVIBE_CONFIG` or pass `--config` to use a different file. The config
+path itself uses this precedence:
+
+```text
+--config > UNVIBE_CONFIG > XDG/default config path
+```
+
+### Environment setup
+
+All runtime choices can instead come from the environment:
 
 ```bash
 export UNVIBE_HARNESS=codex
@@ -98,27 +113,37 @@ export UNVIBE_EFFORT=medium
 unvibe path/to/skill-dir
 ```
 
-Suggested starting pairs are intentionally guidance, not defaults:
-
-| Harness | Evaluation | Rubric |
-|---|---|---|
-| Claude Code | `opus` | `haiku` |
-| Codex | `gpt-5.6-sol` | `gpt-5.6-luna` |
-
-OpenCode models use its `provider/model` format and must also be chosen
-explicitly.
-
-Effort is optional and defaults to `medium`. Configure it with `--effort`,
-`UNVIBE_EFFORT`, or the user config. It maps to the harness-native control:
+For each runtime value, configuration uses this precedence:
 
 ```text
-claude   -> --effort
-codex    -> model_reasoning_effort
-opencode -> --variant
+CLI parameter > environment variable > user config
 ```
 
+### Configuration reference
+
+| Purpose | CLI | Environment | YAML key | Required | Accepted value |
+|---|---|---|---|---|---|
+| Harness | `--harness` | `UNVIBE_HARNESS` | `harness` | Yes | `claude`, `codex`, or `opencode` |
+| Evaluation model | `--evaluation-model` | `UNVIBE_EVALUATION_MODEL` | `evaluation_model` | Yes | Model value accepted by the selected harness |
+| Rubric model | `--rubric-model` | `UNVIBE_RUBRIC_MODEL` | `rubric_model` | Yes | Model value accepted by the selected harness |
+| Effort | `--effort` | `UNVIBE_EFFORT` | `effort` | No | Harness-specific value; defaults to `medium` |
+| Config path | `--config` | `UNVIBE_CONFIG` | — | No | Filesystem path to a version 1 YAML config |
+
+Model and effort values are passed to the selected harness:
+
+| Harness | Model format | Suggested evaluation/rubric pair | Effort mapping and values |
+|---|---|---|---|
+| Claude Code | Alias such as `opus`, `sonnet`, or `haiku`, or a full model ID accepted by `claude --model` | `opus` / `haiku` | `claude --effort`; commonly `low`, `medium`, `high`, `xhigh`, or `max` |
+| Codex | Model slug accepted by `codex --model`, such as `gpt-5.6-sol` | `gpt-5.6-sol` / `gpt-5.6-luna` | `model_reasoning_effort`; `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`, subject to model/account support |
+| OpenCode | Required `provider/model` form accepted by `opencode --model` | Provider-specific | `opencode --variant`; values are provider/model-specific |
+
+The model suggestions are guidance, not defaults. Model availability can vary
+by harness version and account. `unvibe` passes model and effort strings
+through; the selected harness reports unsupported values.
+
 Use `CLAUDE_BIN`, `CODEX_BIN`, or `OPENCODE_BIN` to override the corresponding
-executable.
+executable. Each value is a filesystem path or command name for that harness
+binary.
 
 ## Creating EVALUATION.yaml
 
