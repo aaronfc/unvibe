@@ -193,7 +193,8 @@ Assertions:
 - `rubric`: optional natural-language claims judged against the planned tool
   calls.
 
-Exit code is `0` when every scenario passes and `1` otherwise.
+Exit code is `0` when every scenario passes, `1` when any scenario fails, and
+`130` when the run is interrupted.
 
 ## Development
 
