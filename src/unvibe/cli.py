@@ -621,12 +621,15 @@ def resolve_runtime_configuration(
     ap: argparse.ArgumentParser,
     *,
     require_choices: bool,
+    include_saved_config: bool = True,
 ) -> argparse.Namespace:
     config_path = resolve_config_path(args.config)
-    try:
-        config = load_user_config(config_path)
-    except ValueError as exc:
-        ap.error(str(exc))
+    config = {}
+    if include_saved_config:
+        try:
+            config = load_user_config(config_path)
+        except ValueError as exc:
+            ap.error(str(exc))
 
     args.config_path = config_path
     args.harness = (
@@ -714,7 +717,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args = ap.parse_args(raw_args[1:])
         args.command = "setup"
         return resolve_runtime_configuration(
-            args, ap, require_choices=False
+            args,
+            ap,
+            require_choices=False,
+            include_saved_config=False,
         )
 
     ap = argparse.ArgumentParser(prog="unvibe", description=__doc__)

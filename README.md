@@ -74,7 +74,8 @@ the suggested pair as defaults. Press Enter to accept each default, or type a
 different model. OpenCode models remain explicit because they are
 provider-specific. Setup saves the result to
 `~/.config/unvibe/config.yaml`, or to `$XDG_CONFIG_HOME/unvibe/config.yaml`
-when `XDG_CONFIG_HOME` is set.
+when `XDG_CONFIG_HOME` is set. Running `unvibe setup` again ignores the saved
+answers, repeats the setup process, and overwrites that file.
 
 To configure without prompts:
 

@@ -374,6 +374,41 @@ class TestRuntimeConfiguration:
             "effort": "medium",
         }
 
+    def test_setup_prompts_again_and_overwrites_existing_config(
+        self, monkeypatch, tmp_path
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "version: 1\n"
+            "harness: claude\n"
+            "evaluation_model: opus\n"
+            "rubric_model: haiku\n"
+            "effort: high\n"
+        )
+        answers = iter(["codex", "", ""])
+        prompts = []
+
+        def answer(prompt):
+            prompts.append(prompt)
+            return next(answers)
+
+        monkeypatch.setattr("builtins.input", answer)
+
+        main(["setup", "--config", str(config_path)])
+
+        assert prompts == [
+            "Harness (claude, codex, opencode): ",
+            "Evaluation model (default: gpt-5.6-sol): ",
+            "Rubric model (default: gpt-5.6-luna): ",
+        ]
+        assert yaml.safe_load(config_path.read_text()) == {
+            "version": 1,
+            "harness": "codex",
+            "evaluation_model": "gpt-5.6-sol",
+            "rubric_model": "gpt-5.6-luna",
+            "effort": "medium",
+        }
+
 
 class TestScenarioModels:
     def test_uses_evaluation_model_for_plan_and_rubric_model_for_judge(
