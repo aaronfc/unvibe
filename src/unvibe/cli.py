@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any
@@ -58,6 +59,25 @@ HARNESS_COMMANDS = {
 _HARNESS_PROCESSES: set[subprocess.Popen[str]] = set()
 _HARNESS_PROCESSES_LOCK = Lock()
 _INTERRUPTED = Event()
+
+
+@dataclass
+class ScenarioResult:
+    id: str
+    plan: list[dict[str, Any]] | None = None
+    raw: str = ""
+    must_include: list[dict[str, Any]] = field(default_factory=list)
+    must_not_include: list[dict[str, Any]] = field(default_factory=list)
+    rubric: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+
+    @classmethod
+    def failure(
+        cls, scenario_id: str, error: str, *, raw: str = ""
+    ) -> "ScenarioResult":
+        return cls(id=scenario_id, raw=raw, error=error)
+
+
 NARRATE_INSTRUCTIONS = """\
 You are evaluating a skill. Below in the <SKILL> block is the skill's full
 instructions. In the <USER> block is a user message.
@@ -461,8 +481,8 @@ def run_scenario(
     evaluation_model: str,
     rubric_model: str,
     effort: str = DEFAULT_EFFORT,
-) -> dict[str, Any]:
-    """Run one scenario; return a result dict."""
+) -> ScenarioResult:
+    """Run one scenario; return its structured result."""
     user_msg = scenario["user_message"]
     prompt = (
         NARRATE_INSTRUCTIONS
@@ -471,23 +491,15 @@ def run_scenario(
     raw = call_harness(prompt, harness, evaluation_model, effort)
     plan = extract_json_array(raw)
 
-    result: dict[str, Any] = {
-        "id": scenario["id"],
-        "plan": plan,
-        "raw": raw,
-        "must_include": [],
-        "must_not_include": [],
-        "rubric": [],
-        "error": None,
-    }
+    result = ScenarioResult(id=scenario["id"], plan=plan, raw=raw)
 
     invocation_error = harness_error_message(raw)
     if invocation_error:
-        result["error"] = invocation_error
+        result.error = invocation_error
         return result
 
     if plan is None:
-        result["error"] = (
+        result.error = (
             f"Could not parse action plan from {harness}'s response"
         )
         return result
@@ -496,12 +508,12 @@ def run_scenario(
 
     for pat in scenario.get("must_include", []):
         ok = bool(re.search(pat, searchable, re.IGNORECASE))
-        result["must_include"].append({"pattern": pat, "passed": ok})
+        result.must_include.append({"pattern": pat, "passed": ok})
 
     for pat in scenario.get("must_not_include", []):
         match = re.search(pat, searchable, re.IGNORECASE)
         ok = match is None
-        result["must_not_include"].append(
+        result.must_not_include.append(
             {
                 "pattern": pat,
                 "passed": ok,
@@ -528,13 +540,13 @@ def run_scenario(
 
         invocation_error = harness_error_message(raw_verdicts)
         if invocation_error:
-            result["error"] = f"judge: {invocation_error}"
+            result.error = f"judge: {invocation_error}"
             return result
 
         if not isinstance(parsed, list) or len(parsed) != len(claims):
             err = f"judge returned malformed response (got {type(parsed).__name__}, expected list of {len(claims)}): {raw_verdicts[:200]}"
             for claim in claims:
-                result["rubric"].append(
+                result.rubric.append(
                     {"claim": claim, "passed": False, "verdict": f"FAIL: {err}"}
                 )
         else:
@@ -542,40 +554,46 @@ def run_scenario(
                 verdict_str = str(entry.get("verdict", "")).strip().upper()
                 reason = str(entry.get("reason", "")).strip()
                 passed = verdict_str == "PASS"
-                result["rubric"].append(
+                result.rubric.append(
                     {"claim": claim, "passed": passed, "verdict": f"{verdict_str}: {reason}"}
                 )
 
     return result
 
 
-def scenario_passed(result: dict[str, Any]) -> bool:
-    if result["error"]:
+def scenario_passed(result: ScenarioResult) -> bool:
+    if result.error:
         return False
-    for group in ("must_include", "must_not_include", "rubric"):
-        if any(not item["passed"] for item in result[group]):
+    for group in (
+        result.must_include,
+        result.must_not_include,
+        result.rubric,
+    ):
+        if any(not item["passed"] for item in group):
             return False
     return True
 
 
-def print_report(skill_name: str, results: list[dict[str, Any]], verbose: bool):
+def print_report(
+    skill_name: str, results: list[ScenarioResult], verbose: bool
+):
     passed_count = sum(1 for r in results if scenario_passed(r))
     print(f"\n{skill_name} — {len(results)} scenario(s)\n")
 
     for r in results:
         mark = green("✓") if scenario_passed(r) else red("✗")
-        print(f"  {r['id']:<60} {mark}")
+        print(f"  {r.id:<60} {mark}")
 
-        if r["error"]:
-            print(f"    {red('error:')} {r['error']}")
-            if verbose and r["raw"]:
-                print(f"    {dim('raw:')} {r['raw'][:500]}")
+        if r.error:
+            print(f"    {red('error:')} {r.error}")
+            if verbose and r.raw:
+                print(f"    {dim('raw:')} {r.raw[:500]}")
             continue
 
         for group_name, items in [
-            ("must_include", r["must_include"]),
-            ("must_not_include", r["must_not_include"]),
-            ("rubric", r["rubric"]),
+            ("must_include", r.must_include),
+            ("must_not_include", r.must_not_include),
+            ("rubric", r.rubric),
         ]:
             if not items:
                 continue
@@ -594,9 +612,9 @@ def print_report(skill_name: str, results: list[dict[str, Any]], verbose: bool):
                 if not it["passed"] and group_name == "rubric":
                     print(f"        {dim('verdict:')} {it['verdict']}")
 
-        if verbose and r["plan"]:
+        if verbose and r.plan:
             print(f"    {dim('plan:')}")
-            for entry in r["plan"]:
+            for entry in r.plan:
                 print(f"      {dim('-')} {entry.get('tool')}: {entry.get('args', '')[:120]}")
 
     print(f"\n  {passed_count}/{len(results)} scenarios passed\n")
@@ -912,7 +930,7 @@ def _main(argv: list[str] | None = None):
     )
 
     _INTERRUPTED.clear()
-    results: list[dict[str, Any]] = []
+    results: list[ScenarioResult] = []
     executor = ThreadPoolExecutor(max_workers=args.parallel)
     futures = {}
     try:
@@ -933,8 +951,7 @@ def _main(argv: list[str] | None = None):
                 results.append(fut.result())
                 print(f"  ✓ {s['id']} done", file=sys.stderr)
             except Exception as e:
-                results.append({"id": s["id"], "error": str(e), "plan": None, "raw": "",
-                                "must_include": [], "must_not_include": [], "rubric": []})
+                results.append(ScenarioResult.failure(s["id"], str(e)))
                 print(f"  ✗ {s['id']} crashed: {e}", file=sys.stderr)
     except KeyboardInterrupt:
         for future in futures:
@@ -949,7 +966,7 @@ def _main(argv: list[str] | None = None):
     else:
         executor.shutdown()
 
-    results.sort(key=lambda r: [s["id"] for s in scenarios].index(r["id"]))
+    results.sort(key=lambda r: [s["id"] for s in scenarios].index(r.id))
     print_report(skill_dir.name, results, args.verbose)
     sys.exit(0 if all(scenario_passed(r) for r in results) else 1)
 
