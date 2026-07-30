@@ -1,37 +1,776 @@
 """Unit tests for the pure functions in unvibe.cli.
 
 These exercise the functions that pull structured data out of model output and
-evaluate scenario results — directly, offline, with no `claude`/`CLAUDE_BIN`
-subprocess. The smoke test (tests/smoke.sh) covers packaging and CLI wiring.
+evaluate scenario results — directly and offline. The smoke test
+(tests/smoke.sh) covers packaging and CLI wiring.
 """
 
+import os
+import signal
+import subprocess
+import sys
+import time
+
 import pytest
+import yaml
 
 from unvibe import cli
 from unvibe.cli import (
+    DEFAULT_HARNESS_TIMEOUT_SECONDS,
     SUPPORTED_INSTRUCTION_FILENAMES,
+    ScenarioResult,
+    build_harness_command,
+    call_harness,
+    create_evaluation_yaml,
     extract_json_array,
     extract_yaml_document,
     find_claude_imports,
+    main,
+    parse_args,
     plan_to_searchable,
     resolve_target,
+    print_report,
     run_scenario,
     scenario_passed,
     validate_eval_spec,
 )
 
 
+class TestScenarioResult:
+    def test_defaults_capture_the_complete_result_shape(self):
+        result = ScenarioResult(id="scenario")
+
+        assert result.id == "scenario"
+        assert result.plan is None
+        assert result.raw == ""
+        assert result.must_include == []
+        assert result.must_not_include == []
+        assert result.rubric == []
+        assert result.error is None
+
+    def test_failure_constructs_a_failed_result(self):
+        result = ScenarioResult.failure(
+            "scenario",
+            "worker crashed",
+            raw="partial output",
+        )
+
+        assert result == ScenarioResult(
+            id="scenario",
+            raw="partial output",
+            error="worker crashed",
+        )
+
+
 def _result(*, error=None, must_include=None, must_not_include=None, rubric=None):
-    """Build a scenario-result dict in the shape run_scenario produces."""
-    return {
-        "id": "s",
-        "plan": [],
-        "raw": "",
-        "error": error,
-        "must_include": must_include or [],
-        "must_not_include": must_not_include or [],
-        "rubric": rubric or [],
-    }
+    """Build a ScenarioResult for pass/fail tests."""
+    return ScenarioResult(
+        id="s",
+        plan=[],
+        error=error,
+        must_include=must_include or [],
+        must_not_include=must_not_include or [],
+        rubric=rubric or [],
+    )
+
+
+class TestHarnessCommands:
+    def test_requires_explicit_model(self):
+        with pytest.raises(ValueError, match="model is required"):
+            build_harness_command("claude", "hello")
+
+    @pytest.mark.parametrize(
+        ("harness", "expected"),
+        [
+            (
+                "claude",
+                [
+                    "test-claude",
+                    "-p",
+                    "--no-session-persistence",
+                    "--model",
+                    "test-model",
+                    "--effort",
+                    "high",
+                    "hello",
+                ],
+            ),
+            (
+                "codex",
+                [
+                    "test-codex",
+                    "exec",
+                    "--ephemeral",
+                    "--model",
+                    "test-model",
+                    "-c",
+                    'model_reasoning_effort="high"',
+                    "hello",
+                ],
+            ),
+            (
+                "opencode",
+                [
+                    "test-opencode",
+                    "run",
+                    "--model",
+                    "test-model",
+                    "--variant",
+                    "high",
+                    "hello",
+                ],
+            ),
+        ],
+    )
+    def test_passes_explicit_model_to_selected_harness(
+        self, monkeypatch, harness, expected
+    ):
+        monkeypatch.setitem(cli.HARNESS_BINS, harness, f"test-{harness}")
+
+        assert (
+            build_harness_command(harness, "hello", "test-model", "high")
+            == expected
+        )
+
+    def test_call_harness_runs_selected_adapter(self, monkeypatch):
+        monkeypatch.setitem(cli.HARNESS_BINS, "codex", "test-codex")
+        observed = {}
+
+        class Process:
+            returncode = 0
+
+            def communicate(self, timeout):
+                observed["timeout"] = timeout
+                return ("answer\n", "")
+
+        def popen(command, **kwargs):
+            observed["command"] = command
+            observed["kwargs"] = kwargs
+            return Process()
+
+        monkeypatch.setattr(cli.subprocess, "Popen", popen)
+
+        assert (
+            call_harness(
+                "hello",
+                "codex",
+                "gpt-test",
+                effort="xhigh",
+                timeout=12,
+            )
+            == "answer"
+        )
+        assert observed == {
+            "command": [
+                "test-codex",
+                "exec",
+                "--ephemeral",
+                "--model",
+                "gpt-test",
+                "-c",
+                'model_reasoning_effort="xhigh"',
+                "hello",
+            ],
+            "kwargs": {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "start_new_session": True,
+            },
+            "timeout": 12,
+        }
+
+    def test_call_harness_reports_timeout_with_harness_and_duration(
+        self, monkeypatch
+    ):
+        class Process:
+            returncode = None
+
+            def __init__(self):
+                self.communicate_calls = 0
+
+            def communicate(self, timeout=None):
+                self.communicate_calls += 1
+                if self.communicate_calls == 1:
+                    raise subprocess.TimeoutExpired("test-codex", timeout)
+                return ("", "")
+
+        process = Process()
+        terminated = []
+        monkeypatch.setattr(
+            cli.subprocess, "Popen", lambda *args, **kwargs: process
+        )
+        monkeypatch.setattr(
+            cli,
+            "_terminate_harness_process",
+            lambda observed_process, *, force=False: terminated.append(
+                (observed_process, force)
+            ),
+        )
+
+        assert call_harness("hello", "codex", "gpt-test") == (
+            "__error__: codex timed out after 300s"
+        )
+        assert terminated == [(process, True)]
+        assert DEFAULT_HARNESS_TIMEOUT_SECONDS == 300
+
+    def test_create_surfaces_harness_error(self, monkeypatch):
+        monkeypatch.setattr(
+            cli,
+            "call_harness",
+            lambda *args, **kwargs: "__error__: codex timed out after 300s",
+        )
+
+        with pytest.raises(
+            SystemExit, match="codex timed out after 300s"
+        ):
+            create_evaluation_yaml(
+                "skill instructions",
+                "codex",
+                "gpt-test",
+            )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX signal behavior"
+)
+class TestInterruptHandling:
+    def test_sigint_stops_harness_without_traceback(
+        self, tmp_path
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Always inspect README.md.\n")
+        (skill_dir / "EVALUATIONS.yaml").write_text(
+            "version: 1\n"
+            "scenarios:\n"
+            "  - id: waiting\n"
+            "    user_message: Inspect the repository.\n"
+            "    must_include:\n"
+            "      - 'Read: .*README.md'\n"
+        )
+
+        started_path = tmp_path / "harness.pid"
+        harness_path = tmp_path / "codex"
+        harness_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import time\n"
+            "Path(os.environ['UNVIBE_TEST_HARNESS_PID']).write_text("
+            "str(os.getpid()))\n"
+            "time.sleep(60)\n"
+        )
+        harness_path.chmod(0o755)
+
+        env = os.environ.copy()
+        env["CODEX_BIN"] = str(harness_path)
+        env["UNVIBE_TEST_HARNESS_PID"] = str(started_path)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "unvibe",
+                str(skill_dir),
+                "--harness",
+                "codex",
+                "--evaluation-model",
+                "test-evaluator",
+                "--rubric-model",
+                "test-judge",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+
+        harness_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while not started_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert started_path.exists(), "harness did not start"
+            harness_pid = int(started_path.read_text())
+
+            os.kill(process.pid, signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=5)
+
+            assert process.returncode == 130
+            assert "Interrupted" in stderr
+            assert "Traceback" not in stderr
+            with pytest.raises(ProcessLookupError):
+                os.kill(harness_pid, 0)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            if harness_pid is not None:
+                try:
+                    os.kill(harness_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+class TestRuntimeConfiguration:
+    @pytest.fixture(autouse=True)
+    def clear_runtime_environment(self, monkeypatch, tmp_path):
+        for name in (
+            "UNVIBE_HARNESS",
+            "UNVIBE_MODEL",
+            "UNVIBE_EVALUATION_MODEL",
+            "UNVIBE_RUBRIC_MODEL",
+            "UNVIBE_EFFORT",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(
+            "UNVIBE_CONFIG", str(tmp_path / "missing-config.yaml")
+        )
+
+    def test_missing_configuration_explains_every_configuration_path(
+        self, capsys
+    ):
+        with pytest.raises(SystemExit):
+            parse_args(["skill"])
+
+        error = capsys.readouterr().err
+        assert "--harness" in error
+        assert "--evaluation-model" in error
+        assert "--rubric-model" in error
+        assert "UNVIBE_HARNESS" in error
+        assert "UNVIBE_EVALUATION_MODEL" in error
+        assert "UNVIBE_RUBRIC_MODEL" in error
+        assert "unvibe setup" in error
+        assert "opus" in error
+        assert "haiku" in error
+        assert "gpt-5.6-sol" in error
+        assert "gpt-5.6-luna" in error
+
+    def test_cli_configures_required_values_and_default_effort(self):
+        args = parse_args(
+            [
+                "skill",
+                "--harness",
+                "claude",
+                "--evaluation-model",
+                "opus",
+                "--rubric-model",
+                "haiku",
+            ]
+        )
+
+        assert args.harness == "claude"
+        assert args.evaluation_model == "opus"
+        assert args.rubric_model == "haiku"
+        assert args.effort == "medium"
+
+    def test_environment_configures_all_runtime_values(self, monkeypatch):
+        monkeypatch.setenv("UNVIBE_HARNESS", "opencode")
+        monkeypatch.setenv("UNVIBE_EVALUATION_MODEL", "provider/evaluator")
+        monkeypatch.setenv("UNVIBE_RUBRIC_MODEL", "provider/judge")
+        monkeypatch.setenv("UNVIBE_EFFORT", "high")
+
+        args = parse_args(["skill"])
+
+        assert args.harness == "opencode"
+        assert args.evaluation_model == "provider/evaluator"
+        assert args.rubric_model == "provider/judge"
+        assert args.effort == "high"
+
+    def test_user_config_supplies_all_runtime_values(
+        self, monkeypatch, tmp_path
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "version: 1\n"
+            "harness: codex\n"
+            "evaluation_model: gpt-5.6-sol\n"
+            "rubric_model: gpt-5.6-luna\n"
+            "effort: xhigh\n"
+        )
+        monkeypatch.setenv("UNVIBE_CONFIG", str(config_path))
+
+        args = parse_args(["skill"])
+
+        assert args.harness == "codex"
+        assert args.evaluation_model == "gpt-5.6-sol"
+        assert args.rubric_model == "gpt-5.6-luna"
+        assert args.effort == "xhigh"
+
+    def test_cli_overrides_environment_and_config(
+        self, monkeypatch, tmp_path
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "harness: claude\n"
+            "evaluation_model: config-evaluator\n"
+            "rubric_model: config-judge\n"
+            "effort: low\n"
+        )
+        monkeypatch.setenv("UNVIBE_CONFIG", str(config_path))
+        monkeypatch.setenv("UNVIBE_HARNESS", "codex")
+        monkeypatch.setenv("UNVIBE_EVALUATION_MODEL", "environment-evaluator")
+        monkeypatch.setenv("UNVIBE_RUBRIC_MODEL", "environment-judge")
+        monkeypatch.setenv("UNVIBE_EFFORT", "high")
+
+        args = parse_args(
+            [
+                "skill",
+                "--harness",
+                "opencode",
+                "--evaluation-model",
+                "cli-evaluator",
+                "--rubric-model",
+                "cli-judge",
+                "--effort",
+                "max",
+            ]
+        )
+
+        assert args.harness == "opencode"
+        assert args.evaluation_model == "cli-evaluator"
+        assert args.rubric_model == "cli-judge"
+        assert args.effort == "max"
+
+    def test_legacy_model_flag_is_rejected(self, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(
+                [
+                    "skill",
+                    "--harness",
+                    "claude",
+                    "--evaluation-model",
+                    "opus",
+                    "--rubric-model",
+                    "haiku",
+                    "--model",
+                    "legacy-model",
+                ]
+            )
+
+        assert "unrecognized arguments: --model" in capsys.readouterr().err
+
+    def test_legacy_model_environment_is_ignored(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("UNVIBE_HARNESS", "claude")
+        monkeypatch.setenv("UNVIBE_MODEL", "provider/legacy-model")
+
+        with pytest.raises(SystemExit):
+            parse_args(["skill"])
+
+        error = capsys.readouterr().err
+        assert "evaluation model" in error
+        assert "rubric model" in error
+
+    def test_setup_writes_explicit_configuration(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+
+        main(
+            [
+                "setup",
+                "--config",
+                str(config_path),
+                "--harness",
+                "claude",
+                "--evaluation-model",
+                "opus",
+                "--rubric-model",
+                "haiku",
+                "--effort",
+                "high",
+            ]
+        )
+
+        assert yaml.safe_load(config_path.read_text()) == {
+            "version": 1,
+            "harness": "claude",
+            "evaluation_model": "opus",
+            "rubric_model": "haiku",
+            "effort": "high",
+        }
+
+    def test_setup_accepts_suggested_models_with_empty_responses(
+        self, monkeypatch, tmp_path
+    ):
+        config_path = tmp_path / "config.yaml"
+        answers = iter(["codex", "", ""])
+        prompts = []
+
+        def answer(prompt):
+            prompts.append(prompt)
+            return next(answers)
+
+        monkeypatch.setattr("builtins.input", answer)
+
+        main(["setup", "--config", str(config_path)])
+
+        assert prompts == [
+            "Harness (claude, codex, opencode): ",
+            "Evaluation model (default: gpt-5.6-sol): ",
+            "Rubric model (default: gpt-5.6-luna): ",
+        ]
+        assert yaml.safe_load(config_path.read_text()) == {
+            "version": 1,
+            "harness": "codex",
+            "evaluation_model": "gpt-5.6-sol",
+            "rubric_model": "gpt-5.6-luna",
+            "effort": "medium",
+        }
+
+    def test_setup_prompts_again_and_overwrites_existing_config(
+        self, monkeypatch, tmp_path
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "version: 1\n"
+            "harness: claude\n"
+            "evaluation_model: opus\n"
+            "rubric_model: haiku\n"
+            "effort: high\n"
+        )
+        answers = iter(["codex", "", ""])
+        prompts = []
+
+        def answer(prompt):
+            prompts.append(prompt)
+            return next(answers)
+
+        monkeypatch.setattr("builtins.input", answer)
+
+        main(["setup", "--config", str(config_path)])
+
+        assert prompts == [
+            "Harness (claude, codex, opencode): ",
+            "Evaluation model (default: gpt-5.6-sol): ",
+            "Rubric model (default: gpt-5.6-luna): ",
+        ]
+        assert yaml.safe_load(config_path.read_text()) == {
+            "version": 1,
+            "harness": "codex",
+            "evaluation_model": "gpt-5.6-sol",
+            "rubric_model": "gpt-5.6-luna",
+            "effort": "medium",
+        }
+
+
+class TestEvaluationFilename:
+    @staticmethod
+    def runtime_args(skill_dir):
+        return [
+            str(skill_dir),
+            "--harness",
+            "codex",
+            "--evaluation-model",
+            "evaluator",
+            "--rubric-model",
+            "judge",
+        ]
+
+    @staticmethod
+    def write_spec(path, scenario_id):
+        path.write_text(
+            "version: 1\n"
+            "scenarios:\n"
+            f"  - id: {scenario_id}\n"
+            "    user_message: Inspect the repository.\n"
+            "    must_include:\n"
+            "      - 'Read:'\n"
+        )
+
+    def test_prefers_plural_evaluations_file(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Read files.")
+        self.write_spec(skill_dir / "EVALUATIONS.yaml", "plural")
+        self.write_spec(skill_dir / "EVALUATION.yaml", "legacy")
+        monkeypatch.setattr(
+            cli,
+            "run_scenario",
+            lambda skill, scenario, *args: ScenarioResult(
+                id=scenario["id"]
+            ),
+        )
+
+        with pytest.raises(SystemExit, match="0"):
+            main(self.runtime_args(skill_dir))
+
+        captured = capsys.readouterr()
+        assert "plural" in captured.out
+        assert "legacy" not in captured.out
+        assert "warning:" not in captured.err
+
+    def test_falls_back_to_singular_evaluation_file_with_warning(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Read files.")
+        self.write_spec(skill_dir / "EVALUATION.yaml", "legacy")
+        monkeypatch.setattr(
+            cli,
+            "run_scenario",
+            lambda skill, scenario, *args: ScenarioResult(
+                id=scenario["id"]
+            ),
+        )
+
+        with pytest.raises(SystemExit, match="0"):
+            main(self.runtime_args(skill_dir))
+
+        captured = capsys.readouterr()
+        assert "legacy" in captured.out
+        assert "warning:" in captured.err
+        assert "EVALUATION.yaml is deprecated" in captured.err
+        assert "rename it to EVALUATIONS.yaml" in captured.err
+
+    def test_create_writes_plural_evaluations_file(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Read files.")
+        monkeypatch.setattr(
+            cli,
+            "create_evaluation_yaml",
+            lambda *args: "version: 1\nscenarios: []\n",
+        )
+
+        main(["--create", *self.runtime_args(skill_dir)])
+
+        assert (skill_dir / "EVALUATIONS.yaml").read_text() == (
+            "version: 1\nscenarios: []\n"
+        )
+        assert not (skill_dir / "EVALUATION.yaml").exists()
+        assert "created" in capsys.readouterr().out
+
+
+class TestScenarioModels:
+    def test_uses_evaluation_model_for_plan_and_rubric_model_for_judge(
+        self, monkeypatch
+    ):
+        calls = []
+
+        def call(prompt, harness, model, effort, timeout=180):
+            calls.append((harness, model, effort))
+            if len(calls) == 1:
+                return '[{"tool": "Read", "args": "README.md"}]'
+            return '[{"verdict": "PASS", "reason": "The plan reads it."}]'
+
+        monkeypatch.setattr(cli, "call_harness", call)
+
+        result = run_scenario(
+            "skill instructions",
+            {
+                "id": "reads_docs",
+                "user_message": "Read the docs",
+                "rubric": ["The plan reads the documentation."],
+            },
+            "claude",
+            "sonnet",
+            "haiku",
+            "high",
+        )
+
+        assert calls == [
+            ("claude", "sonnet", "high"),
+            ("claude", "haiku", "high"),
+        ]
+        assert isinstance(result, ScenarioResult)
+        assert result.rubric[0]["passed"] is True
+
+    def test_surfaces_evaluation_harness_error(self, monkeypatch):
+        monkeypatch.setattr(
+            cli,
+            "call_harness",
+            lambda *args, **kwargs: "__error__: codex timed out after 300s",
+        )
+
+        result = run_scenario(
+            "skill instructions",
+            {
+                "id": "reads_docs",
+                "user_message": "Read the docs",
+                "must_include": ["Read:"],
+            },
+            "codex",
+            "gpt-evaluator",
+            "gpt-judge",
+        )
+
+        assert isinstance(result, ScenarioResult)
+        assert result.error == "codex timed out after 300s"
+
+    def test_surfaces_rubric_harness_error(self, monkeypatch):
+        responses = iter(
+            [
+                '[{"tool": "Read", "args": "README.md"}]',
+                "__error__: codex exited 7: boom",
+            ]
+        )
+        monkeypatch.setattr(
+            cli, "call_harness", lambda *args, **kwargs: next(responses)
+        )
+
+        result = run_scenario(
+            "skill instructions",
+            {
+                "id": "reads_docs",
+                "user_message": "Read the docs",
+                "rubric": ["The plan reads the documentation."],
+            },
+            "codex",
+            "gpt-evaluator",
+            "gpt-judge",
+        )
+
+        assert isinstance(result, ScenarioResult)
+        assert result.error == "judge: codex exited 7: boom"
+
+
+class TestScenarioCrashHandling:
+    def test_worker_crash_becomes_a_failed_scenario_result(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("Read files.")
+        (skill_dir / "EVALUATIONS.yaml").write_text(
+            "version: 1\n"
+            "scenarios:\n"
+            "  - id: crashes\n"
+            "    user_message: Inspect the repository.\n"
+            "    must_include:\n"
+            "      - 'Read:'\n"
+        )
+
+        def crash(*args, **kwargs):
+            raise RuntimeError("worker crashed")
+
+        monkeypatch.setattr(cli, "run_scenario", crash)
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    str(skill_dir),
+                    "--harness",
+                    "codex",
+                    "--evaluation-model",
+                    "evaluator",
+                    "--rubric-model",
+                    "judge",
+                ]
+            )
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "crashes" in captured.out
+        assert "error:" in captured.out
+        assert "worker crashed" in captured.out
+        assert "✗ crashes crashed: worker crashed" in captured.err
 
 
 def _write_evaluation(path):
@@ -47,6 +786,19 @@ scenarios:
     )
 
 
+def _runtime_args(tmp_path):
+    return [
+        "--harness",
+        "codex",
+        "--evaluation-model",
+        "test-evaluator",
+        "--rubric-model",
+        "test-judge",
+        "--config",
+        str(tmp_path / "missing-config.yaml"),
+    ]
+
+
 class TestResolveTarget:
     @pytest.mark.parametrize("filename", SUPPORTED_INSTRUCTION_FILENAMES)
     def test_explicit_supported_instruction_file(self, tmp_path, filename):
@@ -56,7 +808,9 @@ class TestResolveTarget:
         target = resolve_target(instruction_path)
 
         assert target.instruction_path == instruction_path.resolve()
-        assert target.evaluation_path == (tmp_path / "EVALUATION.yaml").resolve()
+        assert target.evaluation_path == (
+            tmp_path / "EVALUATIONS.yaml"
+        ).resolve()
 
     @pytest.mark.parametrize("filename", SUPPORTED_INSTRUCTION_FILENAMES)
     def test_directory_with_one_supported_file_discovers_it(self, tmp_path, filename):
@@ -74,7 +828,9 @@ class TestResolveTarget:
         target = resolve_target(tmp_path)
 
         assert target.instruction_path == skill_path.resolve()
-        assert target.evaluation_path == (tmp_path / "EVALUATION.yaml").resolve()
+        assert target.evaluation_path == (
+            tmp_path / "EVALUATIONS.yaml"
+        ).resolve()
 
     def test_ambiguous_directory_lists_candidates_and_requests_file(self, tmp_path):
         (tmp_path / "SKILL.md").write_text("skill")
@@ -106,7 +862,9 @@ class TestResolveTarget:
         target = resolve_target(agents_path)
 
         assert target.instruction_path == agents_path.absolute()
-        assert target.evaluation_path == (tmp_path / "EVALUATION.yaml").resolve()
+        assert target.evaluation_path == (
+            tmp_path / "EVALUATIONS.yaml"
+        ).resolve()
 
     def test_missing_target_has_actionable_error(self, tmp_path):
         missing = tmp_path / "AGENTS.md"
@@ -140,7 +898,7 @@ class TestResolveTarget:
     def test_explicit_evaluation_path_overrides_sibling_default(self, tmp_path):
         instruction_path = tmp_path / "AGENTS.md"
         instruction_path.write_text("instructions")
-        evaluation_path = tmp_path / "evals" / "AGENTS.EVALUATION.yaml"
+        evaluation_path = tmp_path / "evals" / "AGENTS.EVALUATIONS.yaml"
 
         target = resolve_target(instruction_path, evaluation_path)
 
@@ -151,11 +909,11 @@ class TestInstructionPrompts:
     def test_scenario_prompt_uses_format_neutral_terminology(self, monkeypatch):
         prompts = []
 
-        def narrate(prompt):
+        def narrate(prompt, *args, **kwargs):
             prompts.append(prompt)
             return '[{"tool": "Bash", "args": "git status"}]'
 
-        monkeypatch.setattr(cli, "call_claude", narrate)
+        monkeypatch.setattr(cli, "call_harness", narrate)
 
         run_scenario(
             "Always inspect the worktree.",
@@ -164,6 +922,9 @@ class TestInstructionPrompts:
                 "user_message": "Check the status.",
                 "must_include": ["Bash: .*git status"],
             },
+            "codex",
+            "test-evaluator",
+            "test-judge",
         )
 
         assert "<INSTRUCTIONS>" in prompts[0]
@@ -176,15 +937,24 @@ class TestInstructionPrompts:
     ):
         instruction_path = tmp_path / filename
         instruction_path.write_text("Always inspect the worktree.")
-        _write_evaluation(tmp_path / "EVALUATION.yaml")
+        _write_evaluation(tmp_path / "EVALUATIONS.yaml")
         monkeypatch.setattr(
             cli,
-            "call_claude",
-            lambda prompt: '[{"tool": "Bash", "args": "git status"}]',
+            "call_harness",
+            lambda *args, **kwargs: (
+                '[{"tool": "Bash", "args": "git status"}]'
+            ),
         )
 
         with pytest.raises(SystemExit) as exc_info:
-            cli.main([str(instruction_path), "--parallel", "1"])
+            cli.main(
+                [
+                    str(instruction_path),
+                    "--parallel",
+                    "1",
+                    *_runtime_args(tmp_path),
+                ]
+            )
 
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
@@ -199,7 +969,7 @@ class TestInstructionPrompts:
         instruction_path.write_text("Always inspect the worktree.")
         prompts = []
 
-        def generate(prompt, timeout=180):
+        def generate(prompt, *args, **kwargs):
             prompts.append(prompt)
             return """\
 version: 1
@@ -210,23 +980,32 @@ scenarios:
       - The plan checks the status.
 """
 
-        monkeypatch.setattr(cli, "call_claude", generate)
+        monkeypatch.setattr(cli, "call_harness", generate)
 
-        cli.main(["--create", str(instruction_path)])
+        cli.main(
+            [
+                "--create",
+                str(instruction_path),
+                *_runtime_args(tmp_path),
+            ]
+        )
 
-        assert (tmp_path / "EVALUATION.yaml").exists()
+        assert (tmp_path / "EVALUATIONS.yaml").exists()
+        assert not (tmp_path / "EVALUATION.yaml").exists()
         assert "<INSTRUCTIONS>" in prompts[0]
         assert "skill" not in prompts[0].lower()
 
     def test_custom_evaluation_path_is_used(self, tmp_path, monkeypatch, capsys):
         instruction_path = tmp_path / "AGENTS.md"
         instruction_path.write_text("Always inspect the worktree.")
-        evaluation_path = tmp_path / "AGENTS.EVALUATION.yaml"
+        evaluation_path = tmp_path / "AGENTS.EVALUATIONS.yaml"
         _write_evaluation(evaluation_path)
         monkeypatch.setattr(
             cli,
-            "call_claude",
-            lambda prompt: '[{"tool": "Bash", "args": "git status"}]',
+            "call_harness",
+            lambda *args, **kwargs: (
+                '[{"tool": "Bash", "args": "git status"}]'
+            ),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -237,6 +1016,7 @@ scenarios:
                     str(evaluation_path),
                     "--parallel",
                     "1",
+                    *_runtime_args(tmp_path),
                 ]
             )
 
@@ -266,15 +1046,24 @@ class TestLiteralModeWarnings:
     def test_claude_import_warning_is_visible(self, tmp_path, monkeypatch, capsys):
         instruction_path = tmp_path / "CLAUDE.md"
         instruction_path.write_text("Follow @AGENTS.md.")
-        _write_evaluation(tmp_path / "EVALUATION.yaml")
+        _write_evaluation(tmp_path / "EVALUATIONS.yaml")
         monkeypatch.setattr(
             cli,
-            "call_claude",
-            lambda prompt: '[{"tool": "Bash", "args": "git status"}]',
+            "call_harness",
+            lambda *args, **kwargs: (
+                '[{"tool": "Bash", "args": "git status"}]'
+            ),
         )
 
         with pytest.raises(SystemExit) as exc_info:
-            cli.main([str(instruction_path), "--parallel", "1"])
+            cli.main(
+                [
+                    str(instruction_path),
+                    "--parallel",
+                    "1",
+                    *_runtime_args(tmp_path),
+                ]
+            )
 
         assert exc_info.value.code == 0
         warning = capsys.readouterr().err
@@ -337,7 +1126,7 @@ class TestExtractYamlDocument:
         assert extract_yaml_document(text) == "version: 1\nscenarios: []\n"
 
     def test_prose_prefixed_is_anchored_to_version_marker(self):
-        text = "Here is the EVALUATION.yaml you asked for:\nversion: 1\nscenarios:\n  - id: a\n"
+        text = "Here is the EVALUATIONS.yaml you asked for:\nversion: 1\nscenarios:\n  - id: a\n"
         assert extract_yaml_document(text) == "version: 1\nscenarios:\n  - id: a\n"
 
     def test_marker_anchored_to_scenarios_when_version_absent(self):
@@ -485,3 +1274,19 @@ class TestScenarioPassed:
     def test_failing_rubric_fails(self):
         result = _result(rubric=[{"claim": "c", "passed": False}])
         assert scenario_passed(result) is False
+
+
+class TestPrintReport:
+    def test_success_output_is_byte_for_byte_stable(self, capsys):
+        result = _result(
+            must_include=[{"pattern": "Read:", "passed": True}],
+        )
+
+        print_report("skill", [result], verbose=False)
+
+        assert capsys.readouterr().out == (
+            "\nInstruction document: skill — 1 scenario(s)\n\n"
+            f"  {'s':<60} {cli.green('✓')}\n"
+            f"    {'must_include':<16} (1/1 {cli.green('✓')})\n"
+            "\n  1/1 scenarios passed\n\n"
+        )

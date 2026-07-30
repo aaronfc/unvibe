@@ -2,48 +2,98 @@
 unvibe — Tiny literal pseudo-evals for instruction documents.
 
 Usage:
-    unvibe <target> [--evaluation <path>] [--scenario <id>] [--verbose]
-    unvibe --create <target> [--evaluation <path>] [--force]
+    unvibe setup
+    unvibe <target> --harness <name> --evaluation-model <model>
+        --rubric-model <model> [--effort <level>]
+    unvibe --create <target> --harness <name>
+        --evaluation-model <model> --rubric-model <model>
 
 The target may be a SKILL.md, AGENTS.md, or CLAUDE.md file, or a directory
 containing exactly one of those files. Normal mode uses the target's sibling
-EVALUATION.yaml unless --evaluation selects another file. For each scenario:
-  1. Asks Claude (narrate-only) what tool calls it would make.
+EVALUATIONS.yaml unless --evaluation selects another file. For each scenario:
+  1. Asks the selected coding-agent harness what tool calls it would make.
   2. Checks must_include / must_not_include regex patterns.
   3. Optionally asks an LLM judge to score rubric items.
 
 Create mode reads the selected instruction document and writes a first-pass
-EVALUATION.yaml.
+EVALUATIONS.yaml.
 
 Literal mode evaluates only the selected file's text. It does not reproduce
 native effective context, including parent chains, overrides, imports, or
 target-agent loading. Native context execution belongs with backend work in #7.
 
-Exits 0 if all scenarios pass, 1 otherwise.
+Exits 0 if all scenarios pass, 1 otherwise, or 130 when interrupted.
 """
 
 import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any
 
 import yaml
 
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+DEFAULT_EFFORT = "medium"
+DEFAULT_EVALUATIONS_FILENAME = "EVALUATIONS.yaml"
+LEGACY_EVALUATION_FILENAME = "EVALUATION.yaml"
 SUPPORTED_INSTRUCTION_FILENAMES = ("SKILL.md", "AGENTS.md", "CLAUDE.md")
-DEFAULT_EVALUATION_FILENAME = "EVALUATION.yaml"
 CLAUDE_IMPORT_RE = re.compile(
     r"(?<![\w@])@(?P<path>"
     r"(?:~?/|\./|\.\./)?"
     r"(?:[\w.-]+(?:/[\w.-]+)+|[\w.-]+\.(?:md|txt|ya?ml|json))"
     r")"
 )
+DEFAULT_HARNESS_TIMEOUT_SECONDS = 300
+HARNESS_ERROR_PREFIX = "__error__:"
+SUPPORTED_HARNESSES = ("claude", "codex", "opencode")
+MODEL_SUGGESTIONS = {
+    "claude": ("opus", "haiku"),
+    "codex": ("gpt-5.6-sol", "gpt-5.6-luna"),
+}
+HARNESS_BINS = {
+    "claude": os.environ.get("CLAUDE_BIN", "claude"),
+    "codex": os.environ.get("CODEX_BIN", "codex"),
+    "opencode": os.environ.get("OPENCODE_BIN", "opencode"),
+}
+HARNESS_BIN_ENV = {
+    "claude": "CLAUDE_BIN",
+    "codex": "CODEX_BIN",
+    "opencode": "OPENCODE_BIN",
+}
+HARNESS_COMMANDS = {
+    "claude": ("-p", "--no-session-persistence"),
+    "codex": ("exec", "--ephemeral"),
+    "opencode": ("run",),
+}
+_HARNESS_PROCESSES: set[subprocess.Popen[str]] = set()
+_HARNESS_PROCESSES_LOCK = Lock()
+_INTERRUPTED = Event()
+
+
+@dataclass
+class ScenarioResult:
+    id: str
+    plan: list[dict[str, Any]] | None = None
+    raw: str = ""
+    must_include: list[dict[str, Any]] = field(default_factory=list)
+    must_not_include: list[dict[str, Any]] = field(default_factory=list)
+    rubric: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+
+    @classmethod
+    def failure(
+        cls, scenario_id: str, error: str, *, raw: str = ""
+    ) -> "ScenarioResult":
+        return cls(id=scenario_id, raw=raw, error=error)
+
+
 NARRATE_INSTRUCTIONS = """\
 You are evaluating an instruction document. Below in the <INSTRUCTIONS> block
 is the document's full text. In the <USER> block is a user message.
@@ -82,7 +132,7 @@ No prose, no markdown fences, no other text — only the JSON array.
 """
 
 CREATE_INSTRUCTIONS = """\
-You are generating an EVALUATION.yaml file for unvibe, a tiny pseudo-eval
+You are generating an EVALUATIONS.yaml file for unvibe, a tiny pseudo-eval
 runner for instruction documents.
 
 unvibe evaluates an instruction document by showing the agent the document and
@@ -97,7 +147,7 @@ The flattened plan looks like:
   [0] Bash: git status --short
   [1] Read: path/to/file
 
-Generate a detailed first-pass EVALUATION.yaml for the instruction document
+Generate a detailed first-pass EVALUATIONS.yaml for the instruction document
 below.
 
 Required shape:
@@ -148,7 +198,7 @@ Rules:
 """
 
 REPAIR_CREATE_INSTRUCTIONS = """\
-Repair this generated EVALUATION.yaml so it validates for unvibe.
+Repair this generated EVALUATIONS.yaml so it validates for unvibe.
 
 Output ONLY YAML. No prose. No markdown fences.
 
@@ -212,7 +262,9 @@ def resolve_target(
         raise ValueError(f"target {target_path} is not a regular file or directory")
 
     if evaluation is None:
-        evaluation_path = instruction_path.parent / DEFAULT_EVALUATION_FILENAME
+        evaluation_path = (
+            instruction_path.parent / DEFAULT_EVALUATIONS_FILENAME
+        )
     else:
         evaluation_path = Path(evaluation).expanduser().resolve()
 
@@ -260,23 +312,113 @@ def dim(s: str) -> str:
     return f"\033[2m{s}\033[0m"
 
 
-def call_claude(prompt: str, timeout: int = 180) -> str:
-    """Invoke `claude -p` and return the assistant text."""
+def build_harness_command(
+    harness: str,
+    prompt: str,
+    model: str | None = None,
+    effort: str = DEFAULT_EFFORT,
+) -> list[str]:
+    """Build the native noninteractive command for a supported harness."""
+    if harness not in SUPPORTED_HARNESSES:
+        raise ValueError(f"unsupported harness: {harness}")
+    if not model:
+        raise ValueError("model is required")
+
+    command = [HARNESS_BINS[harness], *HARNESS_COMMANDS[harness]]
+    command.extend(["--model", model])
+    if harness == "claude":
+        command.extend(["--effort", effort])
+    elif harness == "codex":
+        command.extend(["-c", f'model_reasoning_effort="{effort}"'])
+    else:
+        command.extend(["--variant", effort])
+    command.append(prompt)
+    return command
+
+
+def _terminate_harness_process(
+    process: subprocess.Popen[str], *, force: bool = False
+) -> None:
+    """Stop a harness and any child processes it spawned."""
+    if process.poll() is not None:
+        return
     try:
-        result = subprocess.run(
-            [CLAUDE_BIN, "-p", prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        if os.name == "posix":
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            os.killpg(process.pid, sig)
+        elif force:
+            process.kill()
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
+
+
+def _stop_harness_processes(*, force: bool = False) -> None:
+    """Prevent new harness calls and stop all active ones."""
+    _INTERRUPTED.set()
+    with _HARNESS_PROCESSES_LOCK:
+        processes = list(_HARNESS_PROCESSES)
+    for process in processes:
+        _terminate_harness_process(process, force=force)
+
+
+def call_harness(
+    prompt: str,
+    harness: str,
+    model: str,
+    effort: str = DEFAULT_EFFORT,
+    timeout: int = DEFAULT_HARNESS_TIMEOUT_SECONDS,
+) -> str:
+    """Invoke a coding-agent harness and return its assistant text."""
+    command = build_harness_command(harness, prompt, model, effort)
+    try:
+        with _HARNESS_PROCESSES_LOCK:
+            if _INTERRUPTED.is_set():
+                return f"{HARNESS_ERROR_PREFIX} interrupted"
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            _HARNESS_PROCESSES.add(process)
     except FileNotFoundError:
-        sys.exit(f"error: '{CLAUDE_BIN}' not on PATH. Set $CLAUDE_BIN.")
-    except subprocess.TimeoutExpired:
-        return ""
-    if result.returncode != 0:
-        return f"__error__: claude exited {result.returncode}: {result.stderr.strip()}"
-    return result.stdout.strip()
+        binary = HARNESS_BINS[harness]
+        sys.exit(
+            f"error: '{binary}' not on PATH. Set ${HARNESS_BIN_ENV[harness]}."
+        )
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_harness_process(process, force=True)
+            process.communicate()
+            return f"{HARNESS_ERROR_PREFIX} {harness} timed out after {timeout}s"
+        except KeyboardInterrupt:
+            _terminate_harness_process(process)
+            process.wait()
+            raise
+    finally:
+        with _HARNESS_PROCESSES_LOCK:
+            _HARNESS_PROCESSES.discard(process)
+
+    if _INTERRUPTED.is_set():
+        return f"{HARNESS_ERROR_PREFIX} interrupted"
+    if process.returncode != 0:
+        return (
+            f"{HARNESS_ERROR_PREFIX} {harness} exited {process.returncode}: "
+            f"{stderr.strip()}"
+        )
+    return stdout.strip()
+
+
+def harness_error_message(text: str) -> str | None:
+    """Return the readable message from an explicit harness error."""
+    if not text.startswith(HARNESS_ERROR_PREFIX):
+        return None
+    return text.removeprefix(HARNESS_ERROR_PREFIX).strip()
 
 
 def extract_json_array(text: str) -> list[dict[str, Any]] | None:
@@ -284,7 +426,7 @@ def extract_json_array(text: str) -> list[dict[str, Any]] | None:
 
     Handles bare JSON, fenced JSON, and JSON with leading/trailing prose.
     """
-    if not text or text.startswith("__error__"):
+    if not text or text.startswith(HARNESS_ERROR_PREFIX):
         return None
     fence = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
     if fence:
@@ -301,7 +443,7 @@ def extract_json_array(text: str) -> list[dict[str, Any]] | None:
 
 def extract_yaml_document(text: str) -> str | None:
     """Pull a YAML document out of a model response."""
-    if not text or text.startswith("__error__"):
+    if not text or text.startswith(HARNESS_ERROR_PREFIX):
         return None
     fence = re.search(r"```(?:ya?ml)?\s*(.*?)\s*```", text, re.DOTALL)
     if fence:
@@ -315,7 +457,7 @@ def extract_yaml_document(text: str) -> str | None:
 
 
 def validate_eval_spec(eval_spec: Any) -> None:
-    """Validate the small subset of EVALUATION.yaml that unvibe understands."""
+    """Validate the small subset of EVALUATIONS.yaml that unvibe understands."""
     if not isinstance(eval_spec, dict):
         raise ValueError("expected top-level YAML mapping")
 
@@ -369,8 +511,13 @@ def validate_eval_spec(eval_spec: Any) -> None:
             )
 
 
-def create_evaluation_yaml(instruction_text: str) -> str:
-    """Ask Claude to generate a first-pass evaluation for an instruction document."""
+def create_evaluation_yaml(
+    instruction_text: str,
+    harness: str,
+    evaluation_model: str,
+    effort: str = DEFAULT_EFFORT,
+) -> str:
+    """Generate a first-pass evaluation for an instruction document."""
     prompt = (
         CREATE_INSTRUCTIONS
         + f"\n\n<INSTRUCTIONS>\n{instruction_text}\n</INSTRUCTIONS>\n"
@@ -378,19 +525,33 @@ def create_evaluation_yaml(instruction_text: str) -> str:
     last_error = "unknown error"
 
     for _ in range(2):
-        raw = call_claude(prompt, timeout=300)
-        yaml_text = extract_yaml_document(raw)
-        if yaml_text is None:
-            last_error = "could not parse YAML from Claude's response"
+        raw = call_harness(
+            prompt,
+            harness,
+            evaluation_model,
+            effort,
+            timeout=DEFAULT_HARNESS_TIMEOUT_SECONDS,
+        )
+        invocation_error = harness_error_message(raw)
+        yaml_text = None
+        if invocation_error:
+            last_error = invocation_error
         else:
-            try:
-                eval_spec = yaml.safe_load(yaml_text)
-                validate_eval_spec(eval_spec)
-                return yaml_text
-            except yaml.YAMLError as exc:
-                last_error = f"generated YAML is invalid: {exc}"
-            except ValueError as exc:
-                last_error = f"generated EVALUATION.yaml did not validate: {exc}"
+            yaml_text = extract_yaml_document(raw)
+            if yaml_text is None:
+                last_error = f"could not parse YAML from {harness}'s response"
+            else:
+                try:
+                    eval_spec = yaml.safe_load(yaml_text)
+                    validate_eval_spec(eval_spec)
+                    return yaml_text
+                except yaml.YAMLError as exc:
+                    last_error = f"generated YAML is invalid: {exc}"
+                except ValueError as exc:
+                    last_error = (
+                        "generated EVALUATIONS.yaml did not validate: "
+                        f"{exc}"
+                    )
 
         prompt = (
             REPAIR_CREATE_INSTRUCTIONS
@@ -425,42 +586,46 @@ def plan_to_searchable(
 
 
 def run_scenario(
-    instruction_text: str, scenario: dict[str, Any]
-) -> dict[str, Any]:
-    """Run one scenario; return a result dict."""
+    instruction_text: str,
+    scenario: dict[str, Any],
+    harness: str,
+    evaluation_model: str,
+    rubric_model: str,
+    effort: str = DEFAULT_EFFORT,
+) -> ScenarioResult:
+    """Run one scenario; return its structured result."""
     user_msg = scenario["user_message"]
     prompt = (
         NARRATE_INSTRUCTIONS
         + f"\n\n<INSTRUCTIONS>\n{instruction_text}\n</INSTRUCTIONS>"
         + f"\n\n<USER>\n{user_msg}\n</USER>\n"
     )
-    raw = call_claude(prompt)
+    raw = call_harness(prompt, harness, evaluation_model, effort)
     plan = extract_json_array(raw)
 
-    result: dict[str, Any] = {
-        "id": scenario["id"],
-        "plan": plan,
-        "raw": raw,
-        "must_include": [],
-        "must_not_include": [],
-        "rubric": [],
-        "error": None,
-    }
+    result = ScenarioResult(id=scenario["id"], plan=plan, raw=raw)
+
+    invocation_error = harness_error_message(raw)
+    if invocation_error:
+        result.error = invocation_error
+        return result
 
     if plan is None:
-        result["error"] = "Could not parse action plan from Claude's response"
+        result.error = (
+            f"Could not parse action plan from {harness}'s response"
+        )
         return result
 
     searchable = plan_to_searchable(plan)
 
     for pat in scenario.get("must_include", []):
         ok = bool(re.search(pat, searchable, re.IGNORECASE))
-        result["must_include"].append({"pattern": pat, "passed": ok})
+        result.must_include.append({"pattern": pat, "passed": ok})
 
     for pat in scenario.get("must_not_include", []):
         match = re.search(pat, searchable, re.IGNORECASE)
         ok = match is None
-        result["must_not_include"].append(
+        result.must_not_include.append(
             {
                 "pattern": pat,
                 "passed": ok,
@@ -480,13 +645,20 @@ def run_scenario(
             JUDGE_INSTRUCTIONS
             + f"\n\n<PLAN>\n{plan_json}\n</PLAN>\n\n<CLAIMS>\n{claims_block}\n</CLAIMS>\n"
         )
-        raw_verdicts = call_claude(judge_prompt)
+        raw_verdicts = call_harness(
+            judge_prompt, harness, rubric_model, effort
+        )
         parsed = extract_json_array(raw_verdicts)
+
+        invocation_error = harness_error_message(raw_verdicts)
+        if invocation_error:
+            result.error = f"judge: {invocation_error}"
+            return result
 
         if not isinstance(parsed, list) or len(parsed) != len(claims):
             err = f"judge returned malformed response (got {type(parsed).__name__}, expected list of {len(claims)}): {raw_verdicts[:200]}"
             for claim in claims:
-                result["rubric"].append(
+                result.rubric.append(
                     {"claim": claim, "passed": False, "verdict": f"FAIL: {err}"}
                 )
         else:
@@ -494,24 +666,30 @@ def run_scenario(
                 verdict_str = str(entry.get("verdict", "")).strip().upper()
                 reason = str(entry.get("reason", "")).strip()
                 passed = verdict_str == "PASS"
-                result["rubric"].append(
+                result.rubric.append(
                     {"claim": claim, "passed": passed, "verdict": f"{verdict_str}: {reason}"}
                 )
 
     return result
 
 
-def scenario_passed(result: dict[str, Any]) -> bool:
-    if result["error"]:
+def scenario_passed(result: ScenarioResult) -> bool:
+    if result.error:
         return False
-    for group in ("must_include", "must_not_include", "rubric"):
-        if any(not item["passed"] for item in result[group]):
+    for group in (
+        result.must_include,
+        result.must_not_include,
+        result.rubric,
+    ):
+        if any(not item["passed"] for item in group):
             return False
     return True
 
 
 def print_report(
-    instruction_name: str, results: list[dict[str, Any]], verbose: bool
+    instruction_name: str,
+    results: list[ScenarioResult],
+    verbose: bool,
 ):
     passed_count = sum(1 for r in results if scenario_passed(r))
     print(
@@ -521,18 +699,18 @@ def print_report(
 
     for r in results:
         mark = green("✓") if scenario_passed(r) else red("✗")
-        print(f"  {r['id']:<60} {mark}")
+        print(f"  {r.id:<60} {mark}")
 
-        if r["error"]:
-            print(f"    {red('error:')} {r['error']}")
-            if verbose and r["raw"]:
-                print(f"    {dim('raw:')} {r['raw'][:500]}")
+        if r.error:
+            print(f"    {red('error:')} {r.error}")
+            if verbose and r.raw:
+                print(f"    {dim('raw:')} {r.raw[:500]}")
             continue
 
         for group_name, items in [
-            ("must_include", r["must_include"]),
-            ("must_not_include", r["must_not_include"]),
-            ("rubric", r["rubric"]),
+            ("must_include", r.must_include),
+            ("must_not_include", r.must_not_include),
+            ("rubric", r.rubric),
         ]:
             if not items:
                 continue
@@ -551,16 +729,188 @@ def print_report(
                 if not it["passed"] and group_name == "rubric":
                     print(f"        {dim('verdict:')} {it['verdict']}")
 
-        if verbose and r["plan"]:
+        if verbose and r.plan:
             print(f"    {dim('plan:')}")
-            for entry in r["plan"]:
+            for entry in r.plan:
                 print(f"      {dim('-')} {entry.get('tool')}: {entry.get('args', '')[:120]}")
 
     print(f"\n  {passed_count}/{len(results)} scenarios passed\n")
 
 
-def main(argv: list[str] | None = None):
+def default_config_path() -> Path:
+    """Return the user configuration path, respecting XDG_CONFIG_HOME."""
+    explicit_path = os.environ.get("UNVIBE_CONFIG")
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+
+    config_root = os.environ.get("XDG_CONFIG_HOME")
+    if config_root:
+        return Path(config_root).expanduser() / "unvibe" / "config.yaml"
+    return Path.home() / ".config" / "unvibe" / "config.yaml"
+
+
+def resolve_config_path(cli_path: str | None) -> Path:
+    return Path(cli_path).expanduser() if cli_path else default_config_path()
+
+
+def load_user_config(path: Path) -> dict[str, Any]:
+    """Load and validate the small unvibe user configuration file."""
+    if not path.exists():
+        return {}
+    try:
+        loaded = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"could not read {path}: {exc}") from exc
+
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} must contain a YAML mapping")
+    if loaded.get("version", 1) != 1:
+        raise ValueError(f"{path} has an unsupported version")
+
+    for key in ("harness", "evaluation_model", "rubric_model", "effort"):
+        value = loaded.get(key)
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            raise ValueError(f"{path}: `{key}` must be a non-empty string")
+    return loaded
+
+
+def add_runtime_options(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument(
+        "--harness",
+        choices=SUPPORTED_HARNESSES,
+        help="Coding-agent harness",
+    )
+    ap.add_argument(
+        "--evaluation-model",
+        help="Model used to generate scenario plans",
+    )
+    ap.add_argument(
+        "--rubric-model",
+        help="Model used to judge rubric claims",
+    )
+    ap.add_argument(
+        "--effort",
+        help=f"Harness reasoning effort (default: {DEFAULT_EFFORT})",
+    )
+    ap.add_argument(
+        "--config",
+        help="User config file (default: ~/.config/unvibe/config.yaml)",
+    )
+
+
+def resolve_runtime_configuration(
+    args: argparse.Namespace,
+    ap: argparse.ArgumentParser,
+    *,
+    require_choices: bool,
+    include_saved_config: bool = True,
+) -> argparse.Namespace:
+    config_path = resolve_config_path(args.config)
+    config = {}
+    if include_saved_config:
+        try:
+            config = load_user_config(config_path)
+        except ValueError as exc:
+            ap.error(str(exc))
+
+    args.config_path = config_path
+    args.harness = (
+        args.harness
+        or os.environ.get("UNVIBE_HARNESS")
+        or config.get("harness")
+    )
+    args.evaluation_model = (
+        args.evaluation_model
+        or os.environ.get("UNVIBE_EVALUATION_MODEL")
+        or config.get("evaluation_model")
+    )
+    args.rubric_model = (
+        args.rubric_model
+        or os.environ.get("UNVIBE_RUBRIC_MODEL")
+        or config.get("rubric_model")
+    )
+    args.effort = (
+        args.effort
+        or os.environ.get("UNVIBE_EFFORT")
+        or config.get("effort")
+        or DEFAULT_EFFORT
+    )
+
+    if args.harness and args.harness not in SUPPORTED_HARNESSES:
+        choices = ", ".join(SUPPORTED_HARNESSES)
+        ap.error(
+            f"harness must be one of: {choices} (got {args.harness!r})"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", args.effort):
+        ap.error(
+            "effort must contain only letters, numbers, dots, "
+            "underscores, or hyphens"
+        )
+
+    if require_choices:
+        missing = []
+        if not args.harness:
+            missing.append("harness")
+        if not args.evaluation_model:
+            missing.append("evaluation model")
+        if not args.rubric_model:
+            missing.append("rubric model")
+        if missing:
+            ap.error(missing_configuration_message(missing, config_path))
+    return args
+
+
+def missing_configuration_message(
+    missing: list[str], config_path: Path
+) -> str:
+    missing_text = ", ".join(missing)
+    return f"""\
+missing required configuration: {missing_text}
+
+Choose all three values with command-line parameters:
+  unvibe <target> --harness claude \\
+    --evaluation-model opus --rubric-model haiku
+
+Or save your choices to {config_path}:
+  unvibe setup --config {config_path}
+
+Or set all three environment variables:
+  UNVIBE_HARNESS
+  UNVIBE_EVALUATION_MODEL
+  UNVIBE_RUBRIC_MODEL
+
+Suggested starting pairs (suggestions, not defaults):
+  Claude/Anthropic: evaluation=opus, rubric=haiku
+  Codex/OpenAI: evaluation=gpt-5.6-sol, rubric=gpt-5.6-luna
+
+Optional effort can be set with --effort, UNVIBE_EFFORT, or setup.
+"""
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments and resolve CLI-over-env-over-file config."""
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args and raw_args[0] == "setup":
+        ap = argparse.ArgumentParser(
+            prog="unvibe setup",
+            description="Save explicit unvibe runtime choices.",
+        )
+        add_runtime_options(ap)
+        args = ap.parse_args(raw_args[1:])
+        args.command = "setup"
+        return resolve_runtime_configuration(
+            args,
+            ap,
+            require_choices=False,
+            include_saved_config=False,
+        )
+
     ap = argparse.ArgumentParser(
+        prog="unvibe",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -584,9 +934,10 @@ def main(argv: list[str] | None = None):
     ap.add_argument(
         "--evaluation",
         metavar="PATH",
-        help="Evaluation YAML path (default: EVALUATION.yaml beside the target)",
+        help="Evaluation YAML path (default: EVALUATIONS.yaml beside the target)",
     )
     ap.add_argument("--scenario", help="Run only this scenario id")
+    add_runtime_options(ap)
     ap.add_argument(
         "--verbose",
         "-v",
@@ -594,9 +945,97 @@ def main(argv: list[str] | None = None):
         help="Show passing assertions and full plans",
     )
     ap.add_argument(
-        "--parallel", type=int, default=3, help="Concurrent scenarios (default 3)"
+        "--parallel",
+        type=int,
+        default=3,
+        help="Concurrent scenarios (default 3)",
     )
-    args = ap.parse_args(argv)
+    args = ap.parse_args(raw_args)
+    args.command = "run"
+    return resolve_runtime_configuration(args, ap, require_choices=True)
+
+
+def prompt_for_choice(label: str, default: str | None = None) -> str:
+    hint = f" (default: {default})" if default else ""
+    while True:
+        try:
+            value = input(f"{label}{hint}: ").strip()
+        except EOFError:
+            sys.exit(
+                "error: setup needs an interactive terminal or explicit "
+                "--harness, --evaluation-model, and --rubric-model values"
+            )
+        if value:
+            return value
+        if default:
+            return default
+        print(f"{label} is required.", file=sys.stderr)
+
+
+def run_setup(args: argparse.Namespace) -> None:
+    if not args.harness:
+        args.harness = prompt_for_choice(
+            "Harness (claude, codex, opencode)"
+        )
+        if args.harness not in SUPPORTED_HARNESSES:
+            choices = ", ".join(SUPPORTED_HARNESSES)
+            sys.exit(f"error: harness must be one of: {choices}")
+
+    suggestions = MODEL_SUGGESTIONS.get(args.harness, (None, None))
+    if not args.evaluation_model:
+        args.evaluation_model = prompt_for_choice(
+            "Evaluation model", suggestions[0]
+        )
+    if not args.rubric_model:
+        args.rubric_model = prompt_for_choice(
+            "Rubric model", suggestions[1]
+        )
+
+    config = {
+        "version": 1,
+        "harness": args.harness,
+        "evaluation_model": args.evaluation_model,
+        "rubric_model": args.rubric_model,
+        "effort": args.effort,
+    }
+    try:
+        args.config_path.parent.mkdir(parents=True, exist_ok=True)
+        args.config_path.write_text(
+            yaml.safe_dump(config, sort_keys=False)
+        )
+    except OSError as exc:
+        sys.exit(f"error: could not write {args.config_path}: {exc}")
+
+    print(f"saved configuration to {args.config_path}")
+    print(f"  harness: {args.harness}")
+    print(f"  evaluation model: {args.evaluation_model}")
+    print(f"  rubric model: {args.rubric_model}")
+    print(f"  effort: {args.effort}")
+
+
+def evaluation_path_for_run(instruction_dir: Path) -> Path:
+    """Select the plural eval file, falling back to the legacy singular name."""
+    eval_path = instruction_dir / DEFAULT_EVALUATIONS_FILENAME
+    if eval_path.exists():
+        return eval_path
+
+    legacy_path = instruction_dir / LEGACY_EVALUATION_FILENAME
+    if legacy_path.exists():
+        print(
+            f"warning: {LEGACY_EVALUATION_FILENAME} is deprecated; "
+            f"rename it to {DEFAULT_EVALUATIONS_FILENAME}",
+            file=sys.stderr,
+        )
+        return legacy_path
+
+    return eval_path
+
+
+def _main(argv: list[str] | None = None):
+    args = parse_args(argv)
+    if args.command == "setup":
+        run_setup(args)
+        return
 
     try:
         target = resolve_target(args.target, args.evaluation)
@@ -612,14 +1051,26 @@ def main(argv: list[str] | None = None):
                 f"error: {target.evaluation_path} already exists. "
                 "Use --force to overwrite it."
             )
-        target.evaluation_path.write_text(create_evaluation_yaml(instruction_text))
+        target.evaluation_path.write_text(
+            create_evaluation_yaml(
+                instruction_text,
+                args.harness,
+                args.evaluation_model,
+                args.effort,
+            )
+        )
         print(f"created {target.evaluation_path}")
         return
 
-    if not target.evaluation_path.exists():
-        sys.exit(f"error: {target.evaluation_path} not found")
+    eval_path = (
+        target.evaluation_path
+        if args.evaluation
+        else evaluation_path_for_run(target.instruction_path.parent)
+    )
+    if not eval_path.exists():
+        sys.exit(f"error: {eval_path} not found")
 
-    eval_spec = yaml.safe_load(target.evaluation_path.read_text())
+    eval_spec = yaml.safe_load(eval_path.read_text())
     scenarios = eval_spec.get("scenarios", [])
     if args.scenario:
         scenarios = [s for s in scenarios if s["id"] == args.scenario]
@@ -628,29 +1079,61 @@ def main(argv: list[str] | None = None):
 
     print(
         f"Running {len(scenarios)} scenario(s) against instruction document "
-        f"{target.instruction_path.name} in literal mode",
+        f"{target.instruction_path.name} in literal mode with {args.harness} "
+        f"(evaluation={args.evaluation_model}, "
+        f"rubric={args.rubric_model}, effort={args.effort})",
         file=sys.stderr,
     )
 
-    results: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=args.parallel) as ex:
-        futures = {
-            ex.submit(run_scenario, instruction_text, scenario): scenario
-            for scenario in scenarios
-        }
+    _INTERRUPTED.clear()
+    results: list[ScenarioResult] = []
+    executor = ThreadPoolExecutor(max_workers=args.parallel)
+    futures = {}
+    try:
+        for scenario in scenarios:
+            future = executor.submit(
+                run_scenario,
+                instruction_text,
+                scenario,
+                args.harness,
+                args.evaluation_model,
+                args.rubric_model,
+                args.effort,
+            )
+            futures[future] = scenario
         for fut in as_completed(futures):
             s = futures[fut]
             try:
                 results.append(fut.result())
                 print(f"  ✓ {s['id']} done", file=sys.stderr)
             except Exception as e:
-                results.append({"id": s["id"], "error": str(e), "plan": None, "raw": "",
-                                "must_include": [], "must_not_include": [], "rubric": []})
+                results.append(ScenarioResult.failure(s["id"], str(e)))
                 print(f"  ✗ {s['id']} crashed: {e}", file=sys.stderr)
+    except KeyboardInterrupt:
+        for future in futures:
+            future.cancel()
+        _stop_harness_processes()
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except KeyboardInterrupt:
+            _stop_harness_processes(force=True)
+            executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown()
 
-    results.sort(key=lambda r: [s["id"] for s in scenarios].index(r["id"]))
+    results.sort(key=lambda r: [s["id"] for s in scenarios].index(r.id))
     print_report(target.instruction_path.name, results, args.verbose)
     sys.exit(0 if all(scenario_passed(r) for r in results) else 1)
+
+
+def main(argv: list[str] | None = None):
+    try:
+        _main(argv)
+    except KeyboardInterrupt:
+        _stop_harness_processes()
+        print("\nInterrupted. Stopped running scenarios.", file=sys.stderr)
+        raise SystemExit(130) from None
 
 
 if __name__ == "__main__":

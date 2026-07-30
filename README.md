@@ -5,15 +5,17 @@
 Tiny literal pseudo-evals for instruction documents.
 
 `unvibe` pokes a `SKILL.md`, `AGENTS.md`, or `CLAUDE.md` with scenario prompts
-and asks Claude what tools it would call. It does not execute those tools. The
-result is a lightweight smoke test for instruction drift: useful, imperfect,
-and intentionally small.
+and asks a coding-agent harness what tools it would call. It does not execute
+those planned tools. The result is a lightweight smoke test for instruction
+drift: useful, imperfect, and
+intentionally small.
 
 ## Install
 
 Run it without installing anything:
 
 ```bash
+uvx --from git+https://github.com/aaronfc/unvibe.git unvibe setup
 uvx --from git+https://github.com/aaronfc/unvibe.git unvibe path/to/skill-dir
 ```
 
@@ -21,22 +23,32 @@ Or install it as a persistent tool:
 
 ```bash
 uv tool install git+https://github.com/aaronfc/unvibe.git
+unvibe setup
 unvibe path/to/skill-dir
 ```
 
 From a local checkout, `uv run unvibe ...` (or the `bin/unvibe` wrapper) runs
 the same command against your working tree.
 
+Before running an evaluation, install and authenticate at least one supported
+harness: Claude Code, Codex, or OpenCode. `unvibe` invokes that harness's local
+CLI; it does not manage the harness installation or login.
+
 ## Usage
 
 ```bash
+unvibe setup
 unvibe path/to/skill-dir
 unvibe path/to/AGENTS.md
 unvibe path/to/CLAUDE.md
 unvibe path/to/skill-dir --scenario happy_path
 unvibe path/to/skill-dir --verbose
 unvibe path/to/skill-dir --parallel 5
-unvibe path/to/CLAUDE.md --evaluation CLAUDE.EVALUATION.yaml
+unvibe path/to/CLAUDE.md --evaluation CLAUDE.EVALUATIONS.yaml
+unvibe path/to/skill-dir \
+  --harness codex \
+  --evaluation-model gpt-5.6-sol \
+  --rubric-model gpt-5.6-luna
 unvibe --create path/to/AGENTS.md
 ```
 
@@ -49,28 +61,122 @@ By default, the evaluation lives beside the selected instruction document:
 
 ```text
 AGENTS.md
-EVALUATION.yaml
+EVALUATIONS.yaml
 ```
 
 Use `--evaluation <path>` when several instruction documents and suites share
 a directory.
 
-`unvibe` uses `claude -p` by default. Set `CLAUDE_BIN` to use a different
-Claude executable.
+Normal runs still accept the legacy `EVALUATION.yaml` filename when the plural
+file is absent, but print a deprecation warning asking you to rename it.
 
 ## Literal mode and its limits
 
 `unvibe` evaluates the selected file's text literally. It does not reproduce
 native parent chains, overrides, imports, target-agent loading, or other
-effective-context behavior. In particular, `@path` imports in `CLAUDE.md` are
-not expanded; the CLI warns when it finds them.
+effective-context behavior. In particular, `@path` imports in `CLAUDE.md`
+are not expanded; the CLI warns when it finds them.
 
-Running an `AGENTS.md` through Claude is a format-neutral pseudo-eval, not a
-claim that Claude and Codex interpret or execute the document identically.
-Native effective-context execution and non-Claude backends remain out of scope
-for this slice and are tracked in [#7](https://github.com/aaronfc/unvibe/issues/7).
+Running a document through the selected harness is a format-neutral
+pseudo-eval, not a claim that the harness reproduces the target agent's native
+loading semantics. [#7](https://github.com/aaronfc/unvibe/issues/7) supplied
+the harness backend; native effective-context loading remains out of scope.
 
-## Creating EVALUATION.yaml
+## Runtime configuration
+
+`unvibe` supports the native Claude Code, Codex, and OpenCode harnesses. Every
+run requires a configured harness, evaluation model, and rubric model. Normal
+runs have no implicit harness or model defaults.
+
+### First-time setup
+
+Choose the three required values interactively:
+
+```bash
+unvibe setup
+```
+
+After you choose Claude or Codex, setup still asks for both models and shows
+the suggested pair as defaults. Press Enter to accept each default, or type a
+different model. OpenCode models remain explicit because they are
+provider-specific. Setup saves the result to
+`~/.config/unvibe/config.yaml`, or to `$XDG_CONFIG_HOME/unvibe/config.yaml`
+when `XDG_CONFIG_HOME` is set. Running `unvibe setup` again ignores the saved
+answers, repeats the setup process, and overwrites that file.
+
+To configure without prompts:
+
+```bash
+unvibe setup \
+  --harness claude \
+  --evaluation-model opus \
+  --rubric-model haiku \
+  --effort medium
+```
+
+You can also write the YAML file directly:
+
+```yaml
+version: 1
+harness: claude
+evaluation_model: opus
+rubric_model: haiku
+effort: medium
+```
+
+Set `UNVIBE_CONFIG` or pass `--config` to use a different file. The config
+path itself uses this precedence:
+
+```text
+--config > UNVIBE_CONFIG > XDG/default config path
+```
+
+### Environment setup
+
+All runtime choices can instead come from the environment:
+
+```bash
+export UNVIBE_HARNESS=codex
+export UNVIBE_EVALUATION_MODEL=gpt-5.6-sol
+export UNVIBE_RUBRIC_MODEL=gpt-5.6-luna
+export UNVIBE_EFFORT=medium
+unvibe path/to/skill-dir
+```
+
+For each runtime value, configuration uses this precedence:
+
+```text
+CLI parameter > environment variable > user config
+```
+
+### Configuration reference
+
+| Purpose | CLI | Environment | YAML key | Required | Accepted value |
+|---|---|---|---|---|---|
+| Harness | `--harness` | `UNVIBE_HARNESS` | `harness` | Yes | `claude`, `codex`, or `opencode` |
+| Evaluation model | `--evaluation-model` | `UNVIBE_EVALUATION_MODEL` | `evaluation_model` | Yes | Model value accepted by the selected harness |
+| Rubric model | `--rubric-model` | `UNVIBE_RUBRIC_MODEL` | `rubric_model` | Yes | Model value accepted by the selected harness |
+| Effort | `--effort` | `UNVIBE_EFFORT` | `effort` | No | Harness-specific value; defaults to `medium` |
+| Config path | `--config` | `UNVIBE_CONFIG` | — | No | Filesystem path to a version 1 YAML config |
+
+Model and effort values are passed to the selected harness:
+
+| Harness | Model format | Suggested evaluation/rubric pair | Effort mapping and values |
+|---|---|---|---|
+| Claude Code | Alias such as `opus`, `sonnet`, or `haiku`, or a full model ID accepted by `claude --model` | `opus` / `haiku` | `claude --effort`; commonly `low`, `medium`, `high`, `xhigh`, or `max` |
+| Codex | Model slug accepted by `codex --model`, such as `gpt-5.6-sol` | `gpt-5.6-sol` / `gpt-5.6-luna` | `model_reasoning_effort`; `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`, subject to model/account support |
+| OpenCode | Required `provider/model` form accepted by `opencode --model` | Provider-specific | `opencode --variant`; values are provider/model-specific |
+
+The suggested pairs are defaults only in the interactive setup prompts; normal
+runs never select models implicitly. Model availability can vary by harness
+version and account. `unvibe` passes model and effort strings through; the
+selected harness reports unsupported values.
+
+Use `CLAUDE_BIN`, `CODEX_BIN`, or `OPENCODE_BIN` to override the corresponding
+executable. Each value is a filesystem path or command name for that harness
+binary.
+
+## Creating EVALUATIONS.yaml
 
 Use `--create` to generate a first-pass eval file from an existing instruction
 document:
@@ -79,18 +185,19 @@ document:
 bin/unvibe --create path/to/AGENTS.md
 ```
 
-This writes `path/to/EVALUATION.yaml`. If that file already exists, `unvibe`
+This uses the same required runtime configuration as a normal evaluation.
+This writes `path/to/EVALUATIONS.yaml`. If that file already exists, `unvibe`
 exits without changing it. Use `--force` to replace it, and combine
 `--evaluation` with `--create` to choose another output path:
 
 ```bash
 unvibe --create path/to/AGENTS.md --force
-unvibe --create path/to/CLAUDE.md --evaluation CLAUDE.EVALUATION.yaml
+unvibe --create path/to/CLAUDE.md --evaluation CLAUDE.EVALUATIONS.yaml
 ```
 
 The generated file is a starting point. Read it before trusting it.
 
-## EVALUATION.yaml
+## EVALUATIONS.yaml
 
 ```yaml
 version: 1
@@ -116,7 +223,8 @@ Assertions:
 - `rubric`: optional natural-language claims judged against the planned tool
   calls.
 
-Exit code is `0` when every scenario passes and `1` otherwise.
+Exit code is `0` when every scenario passes, `1` when any scenario fails, and
+`130` when the run is interrupted.
 
 ## Development
 
@@ -132,7 +240,7 @@ uv run pytest
 ```
 
 `tests/smoke.sh` builds and runs the packaged command against that example
-using a stubbed `CLAUDE_BIN`, so it stays offline and deterministic:
+using stubbed harness binaries, so it stays offline and deterministic:
 
 ```bash
 tests/smoke.sh
