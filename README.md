@@ -2,11 +2,12 @@
 
 # unvibe
 
-Tiny pseudo-evals for `SKILL.md`.
+Tiny literal pseudo-evals for instruction documents.
 
-`unvibe` pokes a skill with scenario prompts and asks a coding-agent harness
-what tools it would call. It does not execute those planned tools. The result
-is a lightweight smoke test for skill drift: useful, imperfect, and
+`unvibe` pokes a `SKILL.md`, `AGENTS.md`, or `CLAUDE.md` with scenario prompts
+and asks a coding-agent harness what tools it would call. It does not execute
+those planned tools. The result is a lightweight smoke test for instruction
+drift: useful, imperfect, and
 intentionally small.
 
 ## Install
@@ -38,25 +39,48 @@ CLI; it does not manage the harness installation or login.
 ```bash
 unvibe setup
 unvibe path/to/skill-dir
+unvibe path/to/AGENTS.md
+unvibe path/to/CLAUDE.md
 unvibe path/to/skill-dir --scenario happy_path
 unvibe path/to/skill-dir --verbose
 unvibe path/to/skill-dir --parallel 5
+unvibe path/to/CLAUDE.md --evaluation CLAUDE.EVALUATIONS.yaml
 unvibe path/to/skill-dir \
   --harness codex \
   --evaluation-model gpt-5.6-sol \
   --rubric-model gpt-5.6-luna
-unvibe --create path/to/skill-dir
+unvibe --create path/to/AGENTS.md
 ```
 
-Each skill directory must contain:
+The target can be an explicit file named `SKILL.md`, `AGENTS.md`, or
+`CLAUDE.md`. For backward compatibility, it can also be a directory containing
+exactly one of those filenames. If a directory contains several supported
+files, name the intended file explicitly.
+
+By default, the evaluation lives beside the selected instruction document:
 
 ```text
-SKILL.md
+AGENTS.md
 EVALUATIONS.yaml
 ```
 
+Use `--evaluation <path>` when several instruction documents and suites share
+a directory.
+
 Normal runs still accept the legacy `EVALUATION.yaml` filename when the plural
 file is absent, but print a deprecation warning asking you to rename it.
+
+## Literal mode and its limits
+
+`unvibe` evaluates the selected file's text literally. It does not reproduce
+native parent chains, overrides, imports, target-agent loading, or other
+effective-context behavior. In particular, `@path` imports in `CLAUDE.md`
+are not expanded; the CLI warns when it finds them.
+
+Running a document through the selected harness is a format-neutral
+pseudo-eval, not a claim that the harness reproduces the target agent's native
+loading semantics. [#7](https://github.com/aaronfc/unvibe/issues/7) supplied
+the harness backend; native effective-context loading remains out of scope.
 
 ## Runtime configuration
 
@@ -154,18 +178,21 @@ binary.
 
 ## Creating EVALUATIONS.yaml
 
-Use `--create` to generate a first-pass eval file from an existing `SKILL.md`:
+Use `--create` to generate a first-pass eval file from an existing instruction
+document:
 
 ```bash
-bin/unvibe --create path/to/skill-dir
+bin/unvibe --create path/to/AGENTS.md
 ```
 
 This uses the same required runtime configuration as a normal evaluation.
-This writes `path/to/skill-dir/EVALUATIONS.yaml`. If that file already exists,
-`unvibe` exits without changing it. Use `--force` to replace it:
+This writes `path/to/EVALUATIONS.yaml`. If that file already exists, `unvibe`
+exits without changing it. Use `--force` to replace it, and combine
+`--evaluation` with `--create` to choose another output path:
 
 ```bash
-unvibe --create path/to/skill-dir --force
+unvibe --create path/to/AGENTS.md --force
+unvibe --create path/to/CLAUDE.md --evaluation CLAUDE.EVALUATIONS.yaml
 ```
 
 The generated file is a starting point. Read it before trusting it.
@@ -201,7 +228,8 @@ Exit code is `0` when every scenario passes, `1` when any scenario fails, and
 
 ## Development
 
-A runnable example lives in [`examples/sample-skill`](examples/sample-skill).
+A backward-compatible `SKILL.md` example lives in
+[`examples/sample-skill`](examples/sample-skill).
 
 The pure functions in `unvibe.cli` (response parsing, spec validation, plan
 flattening, pass/fail evaluation) have fast, offline unit tests. From a source

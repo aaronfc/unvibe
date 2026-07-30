@@ -1,4 +1,4 @@
-"""unvibe — Tiny pseudo-evals for SKILL.md files."""
+"""unvibe — Tiny literal pseudo-evals for instruction documents."""
 
 from unvibe.cli import main
 

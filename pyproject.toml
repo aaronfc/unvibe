@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "unvibe"
 version = "0.1.0"
-description = "Tiny pseudo-evals for SKILL.md files."
+description = "Tiny literal pseudo-evals for instruction documents."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["pyyaml>=6.0"]
